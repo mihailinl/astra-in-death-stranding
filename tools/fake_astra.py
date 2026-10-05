@@ -29,9 +29,11 @@ HEADER, SLOT_DESC, SLOT_DESC_BYTES, SLOTS = 4096, 256, 128, 3
 MAX_W, MAX_H = 1920, 1080
 STRIDE = MAX_W * MAX_H * 4 * 3  # colour, depth, overlay (flag 16: the overlay plane is unused)
 FLAGS = 8 | 16
-RADIUS, HEIGHT = 0.28, 1.62
+RADIUS, FULL_HEIGHT = 0.28, 1.62
 
 def band_colour(params):
+    if params.get("seated"):
+        return (0.7, 0.3, 1.0)
     if params.get("airborne"):
         return (1.0, 0.15, 0.15)
     speed = params.get("speed", 0.0)
@@ -84,13 +86,33 @@ def render(w, h, cam, av):
     up = np.cross(right, fwd)
     ty = np.tan(np.radians(cam["fovY"]) * 0.5)
     tx = ty * w / h
-    xs = ((np.arange(w) + 0.5) / w * 2 - 1) * tx
-    ys = (1 - (np.arange(h) + 0.5) / h * 2) * ty
+    colour = np.zeros((h, w, 4), np.uint8)
+    depth = np.zeros((h, w), np.float32)
+
+    # only the pixels her box covers on screen get rays (she's a small part of the picture)
+    feet = np.array(av["pos"], np.float64)
+    HEIGHT = 1.05 if av.get("params", {}).get("seated") else FULL_HEIGHT  # sitting: shorter
+    corners = feet + np.array([[sx * RADIUS, sy * HEIGHT, sz * RADIUS] for sx in (-1, 1) for sy in (0, 1) for sz in (-1, 1)])
+    rel = corners - eye
+    cz = rel @ fwd
+    if (cz < 0.05).all():
+        return colour, depth  # behind the camera
+    x0, x1, y0, y1 = 0, w, 0, h
+    if (cz > 0.05).all():
+        u = (rel @ right) / cz / tx
+        v = (rel @ up) / cz / ty
+        x0 = int(np.clip(np.floor((u.min() * 0.5 + 0.5) * w) - 2, 0, w))
+        x1 = int(np.clip(np.ceil((u.max() * 0.5 + 0.5) * w) + 2, 0, w))
+        y0 = int(np.clip(np.floor((0.5 - v.max() * 0.5) * h) - 2, 0, h))
+        y1 = int(np.clip(np.ceil((0.5 - v.min() * 0.5) * h) + 2, 0, h))
+        if x1 <= x0 or y1 <= y0:
+            return colour, depth  # off screen
+    xs = ((np.arange(x0, x1) + 0.5) / w * 2 - 1) * tx
+    ys = (1 - (np.arange(y0, y1) + 0.5) / h * 2) * ty
     X, Y = np.meshgrid(xs, ys)
     d = fwd[None, None, :] + X[..., None] * right + Y[..., None] * up
     d /= np.linalg.norm(d, axis=-1, keepdims=True)
 
-    feet = np.array(av["pos"], np.float64)
     a = feet + np.array([0, RADIUS, 0])
     b = feet + np.array([0, HEIGHT - RADIUS, 0])
     # capsule intersection (Inigo Quilez)
@@ -105,7 +127,7 @@ def render(w, h, cam, av):
     B = baba * rdoa - baoa * bard
     C = baba * oaoa - baoa * baoa - RADIUS * RADIUS * baba
     disc = B * B - A * C
-    t = np.full((h, w), np.inf)
+    t = np.full(X.shape, np.inf)
     ok = disc >= 0
     tc = np.where(ok, (-B - np.sqrt(np.maximum(disc, 0))) / np.maximum(A, 1e-9), np.inf)
     yb = baoa + tc * bard
@@ -120,8 +142,6 @@ def render(w, h, cam, av):
         tcap = np.where(tcap > 0, tcap, np.inf)
         t = np.minimum(t, tcap)
     hit = np.isfinite(t)
-    colour = np.zeros((h, w, 4), np.uint8)
-    depth = np.zeros((h, w), np.float32)
     if not hit.any():
         return colour, depth
     P = eye + d * np.where(hit, t, 0)[..., None]
@@ -136,9 +156,11 @@ def render(w, h, cam, av):
     base = np.where(band[..., None], np.array(band_colour(av.get("params", {}))), base)
     light = 0.45 + 0.55 * np.clip(N @ np.array([0.3, 0.9, 0.2]) / np.linalg.norm([0.3, 0.9, 0.2]), 0, 1)
     rgb = np.clip(base * light[..., None], 0, 1)
-    colour[hit, :3] = (rgb[hit] * 255).astype(np.uint8)
-    colour[hit, 3] = 255
-    depth[hit] = (t * (d @ fwd))[hit]
+    sub_c = colour[y0:y1, x0:x1]
+    sub_d = depth[y0:y1, x0:x1]
+    sub_c[hit, :3] = (rgb[hit] * 255).astype(np.uint8)
+    sub_c[hit, 3] = 255
+    sub_d[hit] = (t * (d @ fwd))[hit]
     return colour, depth
 
 
@@ -154,7 +176,7 @@ async def main():
         fresh = asyncio.Event()
 
         async def renderer():
-            # always the newest camera: numpy is slower than DS's frame rate, older cameras are dropped
+            # always the newest camera (older ones are dropped if it ever falls behind)
             frames, t0, last = 0, time.monotonic(), None
             while True:
                 await fresh.wait()
