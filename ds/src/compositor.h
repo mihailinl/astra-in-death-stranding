@@ -27,4 +27,16 @@ namespace compositor
 	void set_screen_fx(float shake_x, float shake_y, float shake_roll, float portal_warp);
 	/// GTA's backbuffer size as ReShade sees it (0 until the first frame).
 	void backbuffer_size(int &width, int &height);
+
+	// ---- Astra (the Astra avatar engine's frames, by default "Local\\AstraFrame" / /dev/shm/astra-frame) ----
+	/// Composite Astra this frame (her engine is linked and she is out).
+	void set_astra_active(bool active);
+	/// DS's camera in the engine's coordinates (Minecraft's angle convention, positions in the engine's frame):
+	/// Astra's picture is re-projected from the camera it was rendered with to this one.
+	void set_astra_host_pose(float yaw, float pitch, float roll, float fov, double x, double y, double z);
+	/// Astra frames uploaded so far.
+	unsigned long long astra_frames();
+	/// Where the engine says its frames are ("/dev/shm/astra-frame" or "Local\\AstraFrame"); reopened if it changed.
+	/// (Only from the present thread: the mapping is opened there.)
+	void set_astra_frames_at(const char *where);
 }

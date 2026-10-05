@@ -27,6 +27,8 @@ uniform float4 FlashRect0; uniform float4 FlashZ0;
 uniform float4 FlashRect1; uniform float4 FlashZ1;
 uniform float4 FlashRect2; uniform float4 FlashZ2;
 uniform float4 FlashRect3; uniform float4 FlashZ3;
+// Astra's place (until the avatar engine draws her): feet, head height, a point ahead of her chest (uv, depth, on)
+uniform float4 AstraV; uniform float4 AstraT; uniform float4 AstraF;
 uniform float Timer < source = "timer"; >;
 
 float scene_view_z(float2 uv)
@@ -120,6 +122,12 @@ float3 PS_Pins(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	draw_pin(px, PinH1, TopH1, float3(1.0, 0.1, 0.9), c);
 	draw_pin(px, PinH2, TopH2, float3(1.0, 0.1, 0.9), c);
 	draw_pin(px, PinH3, TopH3, float3(1.0, 0.1, 0.9), c);
+	if (AstraV.w > 0.5)
+	{
+		draw_pin(px, AstraV, AstraT, float3(0.3, 0.85, 1.0), c);
+		if (AstraF.w > 0.5)
+			draw_edge(px, lerp(AstraV, AstraT, 0.625), AstraF, float3(0.3, 0.85, 1.0), c);
+	}
 	if (Cursor.z > 0.5)
 	{
 		// an arrow cursor: white with a dark outline, tip at the cursor position

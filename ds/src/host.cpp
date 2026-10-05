@@ -270,6 +270,14 @@ namespace host
 		g_ws.start("127.0.0.1", kPort);
 	}
 
+	void camera_angles(const game::WorldTransform &t, float &yaw, float &pitch, float &roll)
+	{
+		const McPose p = camera_pose(t, 0.0f);
+		yaw = p.yaw;
+		pitch = p.pitch;
+		roll = p.roll;
+	}
+
 	void stop()
 	{
 		g_ws.stop();

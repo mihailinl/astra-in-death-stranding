@@ -7,6 +7,8 @@
 #define ImTextureID ImU64
 #include <imgui.h>
 #include <reshade.hpp>
+#include "astra.h"
+#include "astralink.h"
 #include "compositor.h"
 #include "game.h"
 #include "guard.h"
@@ -62,7 +64,8 @@ namespace
 	};
 	Feature f_rays{"DS collision -> Minecraft ground", false}, f_solid{"Minecraft blocks solid for Sam", false},
 		f_damage{"weapons and damage", false}, f_mobs{"mobs vs DS humans", false}, f_scan{"depth scan", false},
-		f_probe{"physics probe / test box", false}, f_survey{"collision layer survey", false};
+		f_probe{"physics probe / test box", false}, f_astra{"Astra follows Sam", false},
+		f_survey{"collision layer survey", false};
 	ULONGLONG g_readPausedUntil = 0;
 
 	template <class F>
@@ -123,6 +126,7 @@ namespace
 	};
 	Pin g_pins[kMaxPins];
 	int g_pinCount = 0;
+	bool g_astraMarker = true; // Astra's debug post (until the avatar engine draws her)
 
 	void log_snapshot(const char *tag)
 	{
@@ -270,6 +274,24 @@ namespace
 			set_float4(runtime, name, zr[0], zr[1], zr[2], 0.0f);
 		}
 
+		// Astra's place (until the avatar engine draws her): a post at her feet, a tick for her facing
+		{
+			Projected base, top, face;
+			const astra::State a = astra::state();
+			if (g_snap.ok && a.valid && astra::enabled())
+			{
+				const double up[3] = {a.pos[0], a.pos[1], a.pos[2] + 1.6};
+				const double ahead[3] = {a.pos[0] + std::cos(a.heading) * 0.6, a.pos[1] + std::sin(a.heading) * 0.6, a.pos[2] + 1.0};
+				base = project(a.pos, aspect);
+				top = project(up, aspect);
+				face = project(ahead, aspect);
+			}
+			const float vis = base.visible && top.visible && g_astraMarker ? 1.0f : 0.0f;
+			set_float4(runtime, "AstraV", base.u, base.v, base.depth, vis);
+			set_float4(runtime, "AstraT", top.u, top.v, top.depth, vis);
+			set_float4(runtime, "AstraF", face.u, face.v, face.depth, vis * (face.visible ? 1.0f : 0.0f));
+		}
+
 		for (int i = 0; i < kMaxPins; ++i)
 		{
 			Projected base, top;
@@ -310,6 +332,7 @@ namespace
 			started = true;
 			rawinput::install();
 			host::start();
+			astralink::start();
 		}
 		read_snapshot(); // also when effects are toggled off
 		uint32_t w = 0, h = 0;
@@ -320,6 +343,8 @@ namespace
 		guarded(f_damage, [] { damage::frame(g_snap); });
 		guarded(f_mobs, [] { mobs::frame(g_snap); });
 		guarded(f_survey, [] { survey::frame(g_snap); });
+		guarded(f_astra, [] { astra::frame(g_snap); });
+		astralink::frame(g_snap, int(w), int(h));
 		guarded(f_scan, [&] { ground::on_present(runtime); });
 		watch::poll();
 
@@ -398,7 +423,7 @@ namespace
 	void on_overlay(effect_runtime *)
 	{
 		ImGui::TextUnformatted(g_status);
-		for (const Feature *f : {&f_rays, &f_solid, &f_damage, &f_mobs, &f_scan, &f_probe, &f_survey})
+		for (const Feature *f : {&f_rays, &f_solid, &f_damage, &f_mobs, &f_scan, &f_probe, &f_astra, &f_survey})
 			if (f->broken)
 				ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "'%s' hit a fault and was switched off (see dsmc.log GUARD)", f->name);
 		const host::Stats st = host::stats();
@@ -430,7 +455,7 @@ namespace
 		if (ImGui::Button(watch::active() ? "watching..." : "Find FOV writer") && !watch::active() && g_snap.ok)
 			watch::start(g_snap.cam_node_ptr + 0x74, 3000);
 		{
-			// the collision copy's layers (Minecraft's barriers), and how each candidate layer does where
+			// the collision copy's layers (Minecraft's barriers and Astra), and how each candidate layer does where
 			// Sam stands (truth: floor under his feet, nothing in his chest)
 			physics::Layers &ly = physics::layers();
 			int ground = int(ly.ground), solid_layer = int(ly.solid);
@@ -488,6 +513,31 @@ namespace
 		const mobs::Stats ms = mobs::stats();
 		ImGui::SameLine();
 		ImGui::Text("humans tracked %d  mob hits %d  creeper hits %d  hit back %d", ms.humans, ms.mob_hits, ms.explosion_hits, ms.retaliations);
+		bool astra_on = astra::enabled();
+		if (ImGui::Checkbox("Astra follows Sam", &astra_on))
+			astra::set_enabled(astra_on);
+		ImGui::SameLine();
+		if (ImGui::Button("Call Astra"))
+			astra::call();
+		ImGui::SameLine();
+		ImGui::Checkbox("Astra marker", &g_astraMarker);
+		{
+			const astra::State a = astra::state();
+			const astra::Stats as = astra::stats();
+			ImGui::SameLine();
+			ImGui::Text("%s  %.1f m/s  steps %llu  blocked %d  falls %d  catch-ups %d  %.2f ms", a.valid ? astra::gait_name(a.gait) : "-", a.speed,
+				as.steps, as.blocked, as.falls, as.teleports, as.last_ms);
+		}
+		{
+			const astralink::Stats ls = astralink::stats();
+			ImGui::Text("Astra engine: %s   sent %llu  received %llu  frames %llu", astralink::connected() ? "linked" : "waiting (127.0.0.1:25600)",
+				ls.sent, ls.received, ls.frames);
+			if (const char *ev = astralink::last_event(); ev[0])
+			{
+				ImGui::SameLine();
+				ImGui::TextDisabled("last: %s", ev);
+			}
+		}
 		ImGui::TextUnformatted(g_physStatus);
 		ImGui::SameLine();
 		if (ImGui::Button("Physics probe (F10)"))
@@ -559,7 +609,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 		break;
 	case DLL_PROCESS_DETACH:
 		if (reserved == nullptr) // FreeLibrary; on process exit the link thread is already gone, joining would hang
+		{
 			host::stop();
+			astralink::stop();
+		}
 		rawinput::uninstall();
 		compositor::unregister(module);
 		reshade::unregister_addon(module);

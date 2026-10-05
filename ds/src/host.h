@@ -12,6 +12,8 @@ namespace host
 {
 	void start();
 	void stop();
+	/// A DS camera's rotation in Minecraft's convention (degrees: yaw 0 = +Z, pitch positive looks down, roll).
+	void camera_angles(const game::WorldTransform &t, float &yaw, float &pitch, float &roll);
 	/// Once per presented frame, with the latest snapshot and DS's backbuffer size.
 	void frame(const game::Snapshot &snap, int backbuffer_w, int backbuffer_h);
 

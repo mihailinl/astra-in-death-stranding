@@ -1,10 +1,12 @@
 #include "compositor.h"
+#include "log.h"
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <reshade.hpp>
 
@@ -12,20 +14,14 @@ using namespace reshade::api;
 
 namespace
 {
-	// Where Minecraft's frames are:
-	//   Linux (DS under Wine/Proton, Minecraft native): the file /dev/shm/dsmc-frame, which Wine sees as Z:\dev\shm\...
-	//   Windows (both native): the named mapping the mod creates there
-	constexpr const wchar_t *kMappingPath = L"Z:\\dev\\shm\\dsmc-frame";
-	constexpr const wchar_t *kMappingName = L"Local\\MCPassthroughFrame";
-	// (both are tried, named mapping first: no need to detect Wine, which Proton may hide)
-	constexpr uint32_t kMagic = 0x5450434D; // "MCPT"
+	constexpr uint32_t kMagic = 0x5450434D; // "MCPT": Minecraft's frame export, and the Astra engine's (same layout)
 	constexpr int kHeader = 4096;
 	constexpr int kSlotDesc = 256;
 	constexpr int kSlotDescBytes = 128;
+	constexpr int32_t kFlagNoOverlay = 16; // the slot holds colour + depth only
 	constexpr const char *kEffect = "MCPassthrough.fx";
 
 	std::atomic<bool> g_registered{false};
-	std::atomic<bool> g_active{false};
 	std::atomic<float> g_hostNear{0.15f};
 	std::atomic<float> g_hostFar{10000.0f};
 	std::atomic<uint32_t> g_bbWidth{0}, g_bbHeight{0};
@@ -33,6 +29,7 @@ namespace
 	std::atomic<float> g_lookLight{-1.0f}, g_lookBias{-1.0f}, g_lookSlope{-1.0f};
 	std::atomic<float> g_shakeX{0.0f}, g_shakeY{0.0f}, g_shakeRoll{0.0f}, g_portalWarp{0.0f};
 	float g_savedLight = -1.0f, g_savedBias = -1.0f, g_savedSlope = -1.0f;
+	std::atomic<int> g_poseLag{0}; // measured: 0 matches best (third and first person)
 
 	struct Pose
 	{
@@ -40,32 +37,55 @@ namespace
 		double x = 0, y = 0, z = 0;
 		bool valid = false;
 	};
-	std::mutex g_poseLock;
-	// GTA's recent camera poses, newest last. The script reads the camera GTA is about to render (the next frame),
-	// while the picture being presented was rendered with the one before: re-project to that (g_poseLag back).
-	Pose g_hostPoses[4];
-	unsigned g_hostPoseCount = 0;
-	std::atomic<int> g_poseLag{0}; // measured: 0 matches best (third and first person)
-	Pose g_mcPose;
-
-	HANDLE g_file = INVALID_HANDLE_VALUE;
-	HANDLE g_mapping = nullptr;
-	const uint8_t *g_view = nullptr;
-	int32_t g_slots = 0;
-	int64_t g_stride = 0;
-	int64_t g_lastPublish = -1;
-	DWORD g_nextOpenAttempt = 0;
 
 	struct Layer
 	{
 		resource tex = {0};
 		resource_view srv = {0};
 	};
-	Layer g_world, g_depth, g_overlay;
-	uint32_t g_width = 0, g_height = 0;
-	bool g_hasFrame = false;
-	float g_mcNear = 0.05f, g_mcFar = 2048.0f;
-	int32_t g_mcFlags = 7;
+
+	/// A picture rendered elsewhere from DS's camera and handed over in shared memory ("MCPT" layout, see the mod's
+	/// FrameExporter): Minecraft's world (and its hand and HUD), or the Astra avatar engine's Astra.
+	struct Source
+	{
+		// Where its frames are:
+		//   Linux (DS under Wine/Proton, the renderer native): a file in /dev/shm, which Wine sees as Z:\dev\shm\...
+		//   Windows (both native): the named mapping the renderer creates
+		// (both are tried, named mapping first: no need to detect Wine, which Proton may hide)
+		wchar_t mapping_name[128], mapping_path[260];
+		const char *label;
+		const char *tex_world, *tex_depth, *tex_overlay; // the effect's texture semantics (overlay: may be null)
+		// the effect's uniforms
+		const char *u_active, *u_planes, *u_rows[3], *u_t, *u_tan;
+
+		std::atomic<bool> active{false};
+		std::mutex pose_lock;
+		// DS's recent camera poses in this source's coordinates, newest last: the picture being presented may be
+		// a frame older than the camera read (g_poseLag back)
+		Pose host_poses[4];
+		unsigned host_pose_count = 0;
+		Pose pose; // the camera the source rendered its frame with
+
+		HANDLE file = INVALID_HANDLE_VALUE;
+		HANDLE mapping = nullptr;
+		const uint8_t *view = nullptr;
+		int32_t slots = 0;
+		int64_t stride = 0;
+		int64_t last_publish = -1;
+		DWORD next_open = 0;
+		Layer world, depth, overlay;
+		uint32_t width = 0, height = 0;
+		bool has_frame = false;
+		float near_plane = 0.05f, far_plane = 2048.0f;
+		int32_t flags = 7;
+		unsigned long long frames = 0;
+	};
+
+	Source g_mc{L"Local\\MCPassthroughFrame", L"Z:\\dev\\shm\\dsmc-frame", "Minecraft", "MCWORLD", "MCDEPTH", "MCOVERLAY",
+		"McActive", "McPlanes", {"WarpRow0", "WarpRow1", "WarpRow2"}, "WarpT", "WarpTan"};
+	Source g_astra{L"Local\\AstraFrame", L"Z:\\dev\\shm\\astra-frame", "Astra", "ASTRAWORLD", "ASTRADEPTH", nullptr,
+		"AstraActive", "AstraPlanes", {"AstraWarpRow0", "AstraWarpRow1", "AstraWarpRow2"}, "AstraWarpT", "AstraWarpTan"};
+	Source *const g_sources[] = {&g_mc, &g_astra};
 
 	template <typename T>
 	T read(const uint8_t *p)
@@ -75,60 +95,65 @@ namespace
 		return v;
 	}
 
-	bool open_mapping()
+	void close_mapping(Source &src)
 	{
-		if (g_view != nullptr)
+		if (src.view != nullptr)
+			UnmapViewOfFile(src.view);
+		if (src.mapping != nullptr)
+			CloseHandle(src.mapping);
+		if (src.file != INVALID_HANDLE_VALUE)
+			CloseHandle(src.file);
+		src.view = nullptr;
+		src.mapping = nullptr;
+		src.file = INVALID_HANDLE_VALUE;
+	}
+
+	bool open_mapping(Source &src)
+	{
+		if (src.view != nullptr)
 			return true;
-		if (GetTickCount() < g_nextOpenAttempt)
+		if (GetTickCount() < src.next_open)
 			return false;
-		g_nextOpenAttempt = GetTickCount() + 1000;
-		g_mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, kMappingName);
-		if (g_mapping == nullptr)
+		src.next_open = GetTickCount() + 1000;
+		src.mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, src.mapping_name);
+		if (src.mapping == nullptr)
 		{
-			g_file = CreateFileW(kMappingPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-			if (g_file == INVALID_HANDLE_VALUE)
+			src.file = CreateFileW(src.mapping_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+				FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (src.file == INVALID_HANDLE_VALUE)
 				return false;
-			g_mapping = CreateFileMappingW(g_file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+			src.mapping = CreateFileMappingW(src.file, nullptr, PAGE_READONLY, 0, 0, nullptr);
 		}
-		if (g_mapping == nullptr)
+		if (src.mapping == nullptr)
 		{
-			if (g_file != INVALID_HANDLE_VALUE)
-				CloseHandle(g_file);
-			g_file = INVALID_HANDLE_VALUE;
+			close_mapping(src);
 			return false;
 		}
-		const auto *header = static_cast<const uint8_t *>(MapViewOfFile(g_mapping, FILE_MAP_READ, 0, 0, kHeader));
+		const auto *header = static_cast<const uint8_t *>(MapViewOfFile(src.mapping, FILE_MAP_READ, 0, 0, kHeader));
 		if (header == nullptr || read<uint32_t>(header) != kMagic)
 		{
 			if (header != nullptr)
 				UnmapViewOfFile(header);
-			CloseHandle(g_mapping);
-			g_mapping = nullptr;
-			if (g_file != INVALID_HANDLE_VALUE)
-				CloseHandle(g_file);
-			g_file = INVALID_HANDLE_VALUE;
+			close_mapping(src);
 			return false;
 		}
-		g_slots = read<int32_t>(header + 12);
-		g_stride = read<int64_t>(header + 16);
+		src.slots = read<int32_t>(header + 12);
+		src.stride = read<int64_t>(header + 16);
 		UnmapViewOfFile(header);
-		g_view = static_cast<const uint8_t *>(MapViewOfFile(g_mapping, FILE_MAP_READ, 0, 0, static_cast<SIZE_T>(kHeader + g_stride * g_slots)));
-		if (g_view == nullptr)
+		src.view = static_cast<const uint8_t *>(MapViewOfFile(src.mapping, FILE_MAP_READ, 0, 0, static_cast<SIZE_T>(kHeader + src.stride * src.slots)));
+		if (src.view == nullptr)
 		{
-			CloseHandle(g_mapping);
-			g_mapping = nullptr;
-			if (g_file != INVALID_HANDLE_VALUE)
-				CloseHandle(g_file);
-			g_file = INVALID_HANDLE_VALUE;
+			close_mapping(src);
 			return false;
 		}
-		reshade::log::message(reshade::log::level::info, "DSMC: connected to Minecraft's frame export");
+		src.last_publish = -1;
+		logf("compositor: connected to %s's frame export (%d slots)", src.label, src.slots);
 		return true;
 	}
 
-	void destroy_layers(device *dev)
+	void destroy_layers(device *dev, Source &src)
 	{
-		for (Layer *layer : {&g_world, &g_depth, &g_overlay})
+		for (Layer *layer : {&src.world, &src.depth, &src.overlay})
 		{
 			if (layer->srv.handle != 0)
 				dev->destroy_resource_view(layer->srv);
@@ -136,8 +161,8 @@ namespace
 				dev->destroy_resource(layer->tex);
 			*layer = Layer();
 		}
-		g_width = g_height = 0;
-		g_hasFrame = false;
+		src.width = src.height = 0;
+		src.has_frame = false;
 	}
 
 	bool create_layer(device *dev, Layer &layer, uint32_t w, uint32_t h, format fmt)
@@ -149,70 +174,83 @@ namespace
 		return dev->create_resource_view(layer.tex, resource_usage::shader_resource, resource_view_desc(fmt), &layer.srv);
 	}
 
-	void bind(effect_runtime *runtime)
+	void bind(effect_runtime *runtime, Source &src)
 	{
-		runtime->update_texture_bindings("MCWORLD", g_world.srv, g_world.srv);
-		runtime->update_texture_bindings("MCDEPTH", g_depth.srv, g_depth.srv);
-		runtime->update_texture_bindings("MCOVERLAY", g_overlay.srv, g_overlay.srv);
+		runtime->update_texture_bindings(src.tex_world, src.world.srv, src.world.srv);
+		runtime->update_texture_bindings(src.tex_depth, src.depth.srv, src.depth.srv);
+		if (src.tex_overlay != nullptr)
+			runtime->update_texture_bindings(src.tex_overlay, src.overlay.srv, src.overlay.srv);
 	}
 
-	/// Upload the newest published Minecraft frame, if there is one we haven't shown yet.
-	void upload(effect_runtime *runtime)
+	/// Upload the newest published frame, if there is one we haven't shown yet.
+	void upload(effect_runtime *runtime, Source &src)
 	{
-		const int64_t published = read<int64_t>(g_view + 32);
-		if (published == g_lastPublish)
+		// the renderer restarted: a new file or mapping replaced the one we hold
+		const uint32_t magic = read<uint32_t>(src.view);
+		if (magic != kMagic)
+		{
+			close_mapping(src);
 			return;
-		const int32_t slot = read<int32_t>(g_view + 40);
-		if (slot < 0 || slot >= g_slots)
+		}
+		const int64_t published = read<int64_t>(src.view + 32);
+		if (published == src.last_publish)
 			return;
-		const uint8_t *desc = g_view + kSlotDesc + kSlotDescBytes * slot;
+		const int32_t slot = read<int32_t>(src.view + 40);
+		if (slot < 0 || slot >= src.slots)
+			return;
+		const uint8_t *desc = src.view + kSlotDesc + kSlotDescBytes * slot;
 		const int64_t seq = read<int64_t>(desc);
 		if (seq & 1)
 			return;
 		const uint32_t w = read<uint32_t>(desc + 24), h = read<uint32_t>(desc + 28);
-		if (w == 0 || h == 0)
+		const int32_t flags = read<int32_t>(desc + 44);
+		const bool has_overlay = (flags & kFlagNoOverlay) == 0;
+		if (w == 0 || h == 0 || int64_t(w) * h * 4 * (has_overlay ? 3 : 2) > src.stride)
 			return;
 		device *dev = runtime->get_device();
-		if (w != g_width || h != g_height)
+		if (w != src.width || h != src.height)
 		{
-			destroy_layers(dev);
-			if (!create_layer(dev, g_world, w, h, format::r8g8b8a8_unorm) ||
-				!create_layer(dev, g_depth, w, h, format::r32_float) ||
-				!create_layer(dev, g_overlay, w, h, format::r8g8b8a8_unorm))
+			destroy_layers(dev, src);
+			if (!create_layer(dev, src.world, w, h, format::r8g8b8a8_unorm) || !create_layer(dev, src.depth, w, h, format::r32_float) ||
+				(src.tex_overlay != nullptr && !create_layer(dev, src.overlay, w, h, format::r8g8b8a8_unorm)))
 			{
-				destroy_layers(dev);
+				destroy_layers(dev, src);
 				return;
 			}
-			g_width = w;
-			g_height = h;
-			bind(runtime);
+			src.width = w;
+			src.height = h;
+			bind(runtime, src);
 		}
-		const uint8_t *base = g_view + kHeader + g_stride * slot;
+		const uint8_t *base = src.view + kHeader + src.stride * slot;
 		const size_t layer = size_t(w) * h * 4;
 		subresource_data data;
 		data.row_pitch = w * 4;
 		data.slice_pitch = static_cast<uint32_t>(layer);
 		data.data = const_cast<uint8_t *>(base);
-		dev->update_texture_region(data, g_world.tex, 0);
+		dev->update_texture_region(data, src.world.tex, 0);
 		data.data = const_cast<uint8_t *>(base + layer);
-		dev->update_texture_region(data, g_depth.tex, 0);
-		data.data = const_cast<uint8_t *>(base + 2 * layer);
-		dev->update_texture_region(data, g_overlay.tex, 0);
+		dev->update_texture_region(data, src.depth.tex, 0);
+		if (src.tex_overlay != nullptr && has_overlay)
+		{
+			data.data = const_cast<uint8_t *>(base + 2 * layer);
+			dev->update_texture_region(data, src.overlay.tex, 0);
+		}
 		if (read<int64_t>(desc) != seq)
-			return; // Minecraft rewrote the slot mid-copy: show the next one instead
-		g_lastPublish = published;
-		g_mcNear = read<float>(desc + 32);
-		g_mcFar = read<float>(desc + 36);
-		g_mcFlags = read<int32_t>(desc + 44);
-		g_mcPose.fov = read<float>(desc + 40);
-		g_mcPose.yaw = read<float>(desc + 72);
-		g_mcPose.pitch = read<float>(desc + 76);
-		g_mcPose.roll = read<float>(desc + 80);
-		g_mcPose.x = read<double>(desc + 48);
-		g_mcPose.y = read<double>(desc + 56);
-		g_mcPose.z = read<double>(desc + 64);
-		g_mcPose.valid = true;
-		g_hasFrame = true;
+			return; // the renderer rewrote the slot mid-copy: show the next one instead
+		src.last_publish = published;
+		src.near_plane = read<float>(desc + 32);
+		src.far_plane = read<float>(desc + 36);
+		src.flags = flags;
+		src.pose.fov = read<float>(desc + 40);
+		src.pose.yaw = read<float>(desc + 72);
+		src.pose.pitch = read<float>(desc + 76);
+		src.pose.roll = read<float>(desc + 80);
+		src.pose.x = read<double>(desc + 48);
+		src.pose.y = read<double>(desc + 56);
+		src.pose.z = read<double>(desc + 64);
+		src.pose.valid = true;
+		src.has_frame = true;
+		++src.frames;
 	}
 
 	/// Camera-to-world rotation, as Minecraft builds it: rotationYXZ(pi - yaw, -pitch, roll) (camera looks down -z).
@@ -283,24 +321,89 @@ namespace
 		watch_effect_file(runtime); // every frame, even when the effect failed to compile
 	}
 
+	void set_bool(effect_runtime *runtime, const char *name, bool value)
+	{
+		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, name); v.handle != 0)
+			runtime->set_uniform_value_bool(v, value);
+	}
+
+	void set_float3(effect_runtime *runtime, const char *name, float x, float y, float z)
+	{
+		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, name); v.handle != 0)
+			runtime->set_uniform_value_float(v, x, y, z);
+	}
+
+	/// One source's frame and its re-projection from the camera it was rendered with to DS's latest (extrapolated
+	/// by the effect's PosePrediction frames). False: nothing of it to show this frame.
+	bool prepare(effect_runtime *runtime, Source &src, float predict)
+	{
+		bool on = src.active && open_mapping(src);
+		if (on)
+			upload(runtime, src);
+		on = on && src.has_frame;
+		// The technique stays enabled (preset); the Active uniforms gate it, so DS passes through untouched until a
+		// frame is here. (Toggling techniques from inside this callback crashes ReShade.)
+		set_bool(runtime, src.u_active, on);
+		if (!on)
+			return false;
+		set_float3(runtime, src.u_planes, src.near_plane, src.far_plane, float(src.flags));
+
+		Pose host, prev;
+		{
+			std::lock_guard<std::mutex> lock(src.pose_lock);
+			const unsigned lag = unsigned(std::clamp(g_poseLag.load(), 0, 2));
+			if (src.host_pose_count > lag)
+				host = src.host_poses[(src.host_pose_count - 1 - lag) & 3];
+			if (src.host_pose_count > lag + 1)
+				prev = src.host_poses[(src.host_pose_count - 2 - lag) & 3];
+		}
+		const bool warp = host.valid && src.pose.valid && !(&src == &g_mc && g_cameraLocked);
+		if (warp && prev.valid && predict != 0.0f)
+		{
+			auto delta = [](float a, float b) { float d = std::fmod(a - b + 540.0f, 360.0f) - 180.0f; return d; };
+			host.yaw += delta(host.yaw, prev.yaw) * predict;
+			host.pitch += (host.pitch - prev.pitch) * predict;
+			host.roll += (host.roll - prev.roll) * predict;
+			host.x += (host.x - prev.x) * predict;
+			host.y += (host.y - prev.y) * predict;
+			host.z += (host.z - prev.z) * predict;
+		}
+		float m[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+		float t[3] = {0, 0, 0};
+		if (warp)
+		{
+			warp_matrix(host, src.pose, m);
+			// T = R_src^T (host position - the source camera's position), in the source camera's space
+			float rm[3][3];
+			camera_rotation(src.pose, rm);
+			const float d[3] = {float(host.x - src.pose.x), float(host.y - src.pose.y), float(host.z - src.pose.z)};
+			for (int i = 0; i < 3; ++i)
+				t[i] = rm[0][i] * d[0] + rm[1][i] * d[1] + rm[2][i] * d[2];
+		}
+		for (int i = 0; i < 3; ++i)
+			set_float3(runtime, src.u_rows[i], m[i][0], m[i][1], m[i][2]);
+		set_float3(runtime, src.u_t, t[0], t[1], t[2]);
+		const float d2r = 3.14159265f / 180.0f;
+		const float tanHost = std::tan((warp ? host.fov : src.pose.fov) * d2r * 0.5f), tanSrc = std::tan(src.pose.fov * d2r * 0.5f);
+		set_float3(runtime, src.u_tan, tanHost, tanSrc, float(src.width) / float(src.height));
+		return true;
+	}
+
 	void on_begin_effects(effect_runtime *runtime, command_list *, resource_view, resource_view)
 	{
 		uint32_t bw = 0, bh = 0;
 		runtime->get_screenshot_width_and_height(&bw, &bh);
 		g_bbWidth = bw;
 		g_bbHeight = bh;
-		bool on = g_active && open_mapping();
-		if (on)
-			upload(runtime);
-		on = on && g_hasFrame;
-		// The technique stays enabled (preset); McActive gates it, so GTA passes through untouched until a
-		// Minecraft frame is here. (Toggling techniques from inside this callback crashes ReShade.)
-		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "McActive"); v.handle != 0)
-			runtime->set_uniform_value_bool(v, on);
-		if (!on)
+		float predict = 0.0f;
+		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "PosePrediction"); v.handle != 0)
+			runtime->get_uniform_value_float(v, &predict, 1);
+		bool any = false;
+		for (Source *src : g_sources)
+			any = prepare(runtime, *src, predict) || any;
+		if (!any)
 			return;
-		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "McPlanes"); v.handle != 0)
-			runtime->set_uniform_value_float(v, g_mcNear, g_mcFar, float(g_mcFlags));
+
 		// a scene's look overrides the preset's light matching and depth bias; the preset's values come back after
 		auto look = [&](const char *name, float want, float &saved) {
 			const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, name);
@@ -321,70 +424,31 @@ namespace
 		look("LightMatch", g_lookLight.load(), g_savedLight);
 		look("DepthBias", g_lookBias.load(), g_savedBias);
 		look("SlopeBias", g_lookSlope.load(), g_savedSlope);
-		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "Shake"); v.handle != 0)
-			runtime->set_uniform_value_float(v, g_shakeX.load(), g_shakeY.load(), g_shakeRoll.load());
+		set_float3(runtime, "Shake", g_shakeX.load(), g_shakeY.load(), g_shakeRoll.load());
 		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "PortalWarp"); v.handle != 0)
 			runtime->set_uniform_value_float(v, g_portalWarp.load());
 		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "HostPlanes"); v.handle != 0)
 			runtime->set_uniform_value_float(v, g_hostNear.load(), g_hostFar.load());
-
-		// Re-projection from Minecraft's pose to GTA's latest (extrapolated by the effect's PosePrediction frames).
-		Pose host, prev;
-		{
-			std::lock_guard<std::mutex> lock(g_poseLock);
-			const unsigned lag = unsigned(std::clamp(g_poseLag.load(), 0, 2));
-			if (g_hostPoseCount > lag)
-				host = g_hostPoses[(g_hostPoseCount - 1 - lag) & 3];
-			if (g_hostPoseCount > lag + 1)
-				prev = g_hostPoses[(g_hostPoseCount - 2 - lag) & 3];
-		}
-		float predict = 0.0f;
-		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "PosePrediction"); v.handle != 0)
-			runtime->get_uniform_value_float(v, &predict, 1);
-		const bool warp = host.valid && g_mcPose.valid && !g_cameraLocked;
-		if (warp && prev.valid && predict != 0.0f)
-		{
-			auto delta = [](float a, float b) { float d = std::fmod(a - b + 540.0f, 360.0f) - 180.0f; return d; };
-			host.yaw += delta(host.yaw, prev.yaw) * predict;
-			host.pitch += (host.pitch - prev.pitch) * predict;
-			host.roll += (host.roll - prev.roll) * predict;
-			host.x += (host.x - prev.x) * predict;
-			host.y += (host.y - prev.y) * predict;
-			host.z += (host.z - prev.z) * predict;
-		}
-		float m[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-		float t[3] = {0, 0, 0};
-		if (warp)
-		{
-			warp_matrix(host, g_mcPose, m);
-			// T = R_mc^T (host position - Minecraft's camera position), in Minecraft's camera space
-			float rm[3][3];
-			camera_rotation(g_mcPose, rm);
-			const float d[3] = {float(host.x - g_mcPose.x), float(host.y - g_mcPose.y), float(host.z - g_mcPose.z)};
-			for (int i = 0; i < 3; ++i)
-				t[i] = rm[0][i] * d[0] + rm[1][i] * d[1] + rm[2][i] * d[2];
-		}
-		const char *rows[3] = {"WarpRow0", "WarpRow1", "WarpRow2"};
-		for (int i = 0; i < 3; ++i)
-			if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, rows[i]); v.handle != 0)
-				runtime->set_uniform_value_float(v, m[i][0], m[i][1], m[i][2]);
-		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "WarpT"); v.handle != 0)
-			runtime->set_uniform_value_float(v, t[0], t[1], t[2]);
-		const float d2r = 3.14159265f / 180.0f;
-		const float tanHost = std::tan((warp ? host.fov : g_mcPose.fov) * d2r * 0.5f), tanMc = std::tan(g_mcPose.fov * d2r * 0.5f);
-		if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "WarpTan"); v.handle != 0)
-			runtime->set_uniform_value_float(v, tanHost, tanMc, float(g_width) / float(g_height));
 	}
 
 	void on_reloaded_effects(effect_runtime *runtime)
 	{
-		if (g_width != 0)
-			bind(runtime);
+		for (Source *src : g_sources)
+			if (src->width != 0)
+				bind(runtime, *src);
 	}
 
 	void on_destroy_effect_runtime(effect_runtime *runtime)
 	{
-		destroy_layers(runtime->get_device());
+		for (Source *src : g_sources)
+			destroy_layers(runtime->get_device(), *src);
+	}
+
+	void push_pose(Source &src, float yaw, float pitch, float roll, float fov, double x, double y, double z)
+	{
+		std::lock_guard<std::mutex> lock(src.pose_lock);
+		src.host_poses[src.host_pose_count & 3] = {yaw, pitch, roll, fov, x, y, z, true};
+		++src.host_pose_count;
 	}
 }
 
@@ -413,7 +477,7 @@ namespace compositor
 
 	void set_active(bool active)
 	{
-		g_active = active;
+		g_mc.active = active;
 	}
 
 	void set_host_planes(float near_clip, float far_clip)
@@ -450,13 +514,50 @@ namespace compositor
 
 	void set_host_pose(float yaw, float pitch, float roll, float fov, double x, double y, double z)
 	{
-		std::lock_guard<std::mutex> lock(g_poseLock);
-		g_hostPoses[g_hostPoseCount & 3] = {yaw, pitch, roll, fov, x, y, z, true};
-		++g_hostPoseCount;
+		push_pose(g_mc, yaw, pitch, roll, fov, x, y, z);
 	}
 
 	void set_pose_lag(int frames)
 	{
 		g_poseLag = frames;
+	}
+
+	void set_astra_active(bool active)
+	{
+		g_astra.active = active;
+	}
+
+	void set_astra_host_pose(float yaw, float pitch, float roll, float fov, double x, double y, double z)
+	{
+		push_pose(g_astra, yaw, pitch, roll, fov, x, y, z);
+	}
+
+	unsigned long long astra_frames()
+	{
+		return g_astra.frames;
+	}
+
+	void set_astra_frames_at(const char *where)
+	{
+		// "/dev/shm/name" (Linux: the file, seen by Wine under Z:) or a Win32 mapping name ("Local\\name")
+		wchar_t name[128] = L"", path[260] = L"";
+		if (where[0] == '/')
+		{
+			int n = std::swprintf(path, 260, L"Z:%hs", where);
+			for (int i = 0; i < n; ++i)
+				if (path[i] == L'/')
+					path[i] = L'\\';
+			std::swprintf(name, 128, L"Local\\%hs", std::strrchr(where, '/') + 1);
+		}
+		else
+			std::swprintf(name, 128, L"%hs", where);
+		if (std::wcscmp(name, g_astra.mapping_name) == 0 && std::wcscmp(path, g_astra.mapping_path) == 0)
+			return;
+		std::wcscpy(g_astra.mapping_name, name);
+		std::wcscpy(g_astra.mapping_path, path);
+		close_mapping(g_astra);
+		g_astra.has_frame = false;
+		g_astra.next_open = 0;
+		logf("compositor: Astra's frames at %s", where);
 	}
 }
