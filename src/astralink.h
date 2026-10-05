@@ -20,6 +20,8 @@ namespace astralink
 	/// How far Astra went (engine coordinates) since the camera of `frame` was sent: a picture the engine drew for
 	/// that camera is moved by this much (she runs, the vehicle she rides drives) while it's shown later.
 	bool moved_since(unsigned long long frame, double out[3]);
+	/// DS's sun (or moon) and how much of her is in it: sent to the engine as {"t":"light"} (a few times a second).
+	void set_light(bool valid, const float toward_ds[3], const float color[3], float intensity, float visible);
 	/// Any message to the engine (animation commands and the like).
 	void send_raw(const char *message);
 

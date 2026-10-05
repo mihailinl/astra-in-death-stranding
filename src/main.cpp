@@ -14,9 +14,11 @@
 #include "layer.h"
 #include "log.h"
 #include "physics.h"
+#include "sun.h"
 #include "ui.h"
 #include <windows.h>
 #include <cstdarg>
+#include <algorithm>
 #include <cstdio>
 
 using namespace reshade::api;
@@ -34,6 +36,8 @@ namespace
 	FILE *g_log = nullptr;
 	ULONGLONG g_readPausedUntil = 0;
 	bool g_followBroken = false;
+	sun::State g_sun{};
+	float g_lit = 1.0f;
 
 	/// The camera read retries after a fault (pointers are briefly stale while the game loads)
 	void read_snapshot()
@@ -70,6 +74,27 @@ namespace
 		uint32_t w = 0, h = 0;
 		runtime->get_screenshot_width_and_height(&w, &h);
 		astralink::frame(g_snap, int(w), int(h));
+
+		// DS's sun (or moon): her light in the engine, and her shadow on DS's ground
+		g_sun = sun::read();
+		float lit = 1.0f;
+		if (g_sun.valid && g_snap.ok && !g_followBroken)
+			guard::run("Astra in the sun", [&] { lit = astra::sunlit(g_sun.toward, reinterpret_cast<const void *>(g_snap.sam_ptr)); });
+		g_lit += (lit - g_lit) * 0.15f;
+		astralink::set_light(g_sun.valid, g_sun.toward, g_sun.color, g_sun.intensity, g_lit);
+		const float toward_gl[3] = {g_sun.toward[0], g_sun.toward[2], -g_sun.toward[1]};
+		// her shadow: while the light is up (it fades as it sets) and she stands in it
+		const float up = g_sun.valid ? std::clamp(g_sun.toward[2] * 5.0f, 0.0f, 1.0f) : 0.0f;
+		layer::set_sun(toward_gl, up * g_lit);
+		static ULONGLONG next_sun_log = 0;
+		if (g_sun.valid && GetTickCount64() >= next_sun_log)
+		{
+			next_sun_log = GetTickCount64() + 10000;
+			const auto &c = g_sun.columns;
+			logf("SUN intensity %.4g colour %.3f %.3f %.3f lit %.2f | c0 %+.3f %+.3f %+.3f | c1 %+.3f %+.3f %+.3f | c2 %+.3f %+.3f %+.3f | cam fwd %+.3f %+.3f %+.3f",
+				g_sun.intensity, g_sun.color[0], g_sun.color[1], g_sun.color[2], g_lit, c[0][0], c[0][1], c[0][2], c[1][0], c[1][1], c[1][2], c[2][0], c[2][1],
+				c[2][2], g_snap.cam.col[1][0], g_snap.cam.col[1][1], g_snap.cam.col[1][2]);
+		}
 	}
 
 	void on_overlay(effect_runtime *)
@@ -94,6 +119,11 @@ namespace
 		const astra::Stats as = astra::stats();
 		ImGui::Text("%s%s%s  %.1f m/s  steps %llu  blocked %d  falls %d  catch-ups %d  rides %d  %.2f ms", a.valid ? astra::gait_name(a.gait) : "-",
 			as.vehicle[0] ? ", riding in the " : "", as.vehicle, a.speed, as.steps, as.blocked, as.falls, as.teleports, as.rides, as.last_ms);
+		float size = astra::scale();
+		ImGui::SetNextItemWidth(160);
+		if (ImGui::SliderFloat("size", &size, 0.7f, 1.6f, "x%.2f"))
+			astra::set_scale(size);
+		ImGui::SameLine();
 		float lift, forward;
 		astra::seat_offset(lift, forward, false);
 		ImGui::SetNextItemWidth(160);
@@ -103,6 +133,16 @@ namespace
 		seat |= ImGui::SliderFloat("seat forward", &forward, -1.0f, 1.0f, "%.2f m");
 		if (seat)
 			astra::seat_offset(lift, forward, true);
+		ImGui::TextDisabled("%s", sun::status());
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(80);
+		ImGui::SliderInt("sun axis", &sun::axis(), 1, 2);
+		if (g_sun.valid)
+		{
+			ImGui::SameLine();
+			ImGui::TextDisabled("toward %+.2f %+.2f %+.2f  colour %.2f %.2f %.2f  intensity %.3g  she's lit %.0f%%", g_sun.toward[0], g_sun.toward[1],
+				g_sun.toward[2], g_sun.color[0], g_sun.color[1], g_sun.color[2], g_sun.intensity, g_lit * 100.0f);
+		}
 		ui::overlay();
 		if (g_snap.ok)
 			ImGui::TextDisabled("Sam %.2f %.2f %.2f   her %.2f %.2f %.2f", g_snap.sam.pos[0], g_snap.sam.pos[1], g_snap.sam.pos[2], a.pos[0], a.pos[1], a.pos[2]);

@@ -31,6 +31,12 @@ namespace astra
 		constexpr float kStuckSeconds = 1.6f, kStuckDistance = 3.0f;
 		constexpr float kFallLimit = 3.0f;        // seconds falling: she's lost
 		constexpr float kFloorApart = 2.2f, kApartSeconds = 2.5f; // metres above or below Sam, for this long
+		// Sam standing (or turning on the spot): she stays where she is, near him, and now and then strolls a little
+		constexpr float kSamGoes = 1.0f, kSamStops = 0.5f;  // his pace (m/s) that starts / ends "Sam is going"
+		constexpr float kStayFar = 5.0f, kStayNear = 0.9f;   // further than this she comes closer, nearer she steps away
+		constexpr float kComeTo = 2.5f;                      // ... to this far from him
+		constexpr float kStrollMin = 8.0f, kStrollMax = 20.0f; // seconds between strolls
+		constexpr float kStrollPace = 0.8f, kComePace = 2.5f; // 0.8: her calm walk (the engine's walk clip fits 0.7)
 
 		bool g_enabled = true;
 		bool g_callRequested = false;
@@ -41,6 +47,20 @@ namespace astra
 		bool g_samPrevValid = false;
 		float g_samSpeed = 0.0f;
 		float g_stuckTime = 0.0f, g_bestDist = 1e9f, g_apartTime = 0.0f;
+		float g_scale = 1.2f; // her size (the engine scales her; her body here and her calm pace scale with it)
+		bool g_samGoes = false;
+		bool g_hasAim = false, g_strolling = false; // a place near Sam she's walking to while he stands
+		double g_aim[3] = {};
+		float g_strollIn = 10.0f;
+		uint32_t g_rng = 0x2545F491u;
+
+		float random01()
+		{
+			g_rng ^= g_rng << 13;
+			g_rng ^= g_rng >> 17;
+			g_rng ^= g_rng << 5;
+			return float(g_rng & 0xFFFFFF) / float(0x1000000);
+		}
 		LARGE_INTEGER g_prevTick{}, g_freq{};
 		const void *g_ignore = nullptr; // Sam (and his cargo): the ground rays see characters
 		Stats g_stats{};
@@ -90,13 +110,13 @@ namespace astra
 		bool body_free(double x, double y, double z)
 		{
 			bool called = false;
-			const double chest[3] = {x, y, z + kChest};
+			const double chest[3] = {x, y, z + kChest * g_scale};
 			++g_stats.spheres;
-			if (physics::intersect_sphere(chest, kBodyR, physics::layers().solid, called) || !called)
+			if (physics::intersect_sphere(chest, kBodyR * g_scale, physics::layers().solid, called) || !called)
 				return false;
-			const double head[3] = {x, y, z + kHead};
+			const double head[3] = {x, y, z + kHead * g_scale};
 			++g_stats.spheres;
-			return !physics::intersect_sphere(head, kHeadR, physics::layers().solid, called) && called;
+			return !physics::intersect_sphere(head, kHeadR * g_scale, physics::layers().solid, called) && called;
 		}
 
 		/// One short step from her position: where she ends up (ground under the new spot, or the same height in the
@@ -298,17 +318,18 @@ namespace astra
 		const auto t0 = std::chrono::steady_clock::now();
 		g_ignore = reinterpret_cast<const void *>(s.sam_ptr);
 
-		// Sam: his pace and facing (his movement direction while he moves, his body's facing when he stands)
+		// Sam: his pace, and the way he goes (only his movement turns it: turning on the spot doesn't move her spot)
 		if (g_samPrevValid && dt > 0.0f)
 		{
 			const double dx = s.sam.pos[0] - g_samPrev[0], dy = s.sam.pos[1] - g_samPrev[1];
 			const float v = float(std::sqrt(dx * dx + dy * dy)) / dt;
 			g_samSpeed += (std::min(v, 30.0f) - g_samSpeed) * std::min(1.0f, dt * 6.0f);
-			g_samHeading = g_samSpeed > 1.0f && v > 0.5f ? turn_toward(g_samHeading, std::atan2(float(dy), float(dx)), dt * 4.0f)
-														   : turn_toward(g_samHeading, sam_heading_from(s), dt * 2.0f);
+			if (g_samSpeed > 1.0f && v > 0.5f)
+				g_samHeading = turn_toward(g_samHeading, std::atan2(float(dy), float(dx)), dt * 4.0f);
 		}
 		else
 			g_samHeading = sam_heading_from(s);
+		g_samGoes = g_samGoes ? g_samSpeed > kSamStops : g_samSpeed > kSamGoes;
 		std::copy(s.sam.pos, s.sam.pos + 3, g_samPrev);
 		g_samPrevValid = true;
 
@@ -411,16 +432,68 @@ namespace astra
 		else
 			g_apartTime = 0.0f;
 
+		// where to go: beside and behind Sam while he goes; while he stands, stay (or the place she's walking to)
 		double target[3];
-		spot(s, target);
+		float pace_cap = kMaxSpeed;
+		if (g_samGoes)
+		{
+			g_hasAim = false;
+			g_strollIn = kStrollMin + random01() * (kStrollMax - kStrollMin);
+			spot(s, target);
+		}
+		else
+		{
+			if (!g_hasAim)
+			{
+				const float ax = samDist > 1e-3f ? float(-toSamX) / samDist : std::cos(a.heading);
+				const float ay = samDist > 1e-3f ? float(-toSamY) / samDist : std::sin(a.heading);
+				if (samDist > kStayFar || samDist < kStayNear)
+				{
+					// too far: come closer along the line to him; too close: a step away from him
+					const float r = samDist > kStayFar ? kComeTo : 1.5f;
+					g_aim[0] = s.sam.pos[0] + ax * r, g_aim[1] = s.sam.pos[1] + ay * r, g_aim[2] = s.sam.pos[2];
+					g_hasAim = true;
+					g_strolling = false;
+				}
+				else if ((g_strollIn -= dt) <= 0.0f)
+				{
+					// a stroll: somewhere 1.6..3.5 m from Sam with ground and room for her
+					g_strollIn = kStrollMin + random01() * (kStrollMax - kStrollMin);
+					const float ang = random01() * kTwoPi, r = 1.6f + random01() * 1.9f;
+					const double x = s.sam.pos[0] + std::cos(ang) * r, y = s.sam.pos[1] + std::sin(ang) * r;
+					const Ground g = ground_at(x, y, s.sam.pos[2] + 1.5, s.sam.pos[2] - 2.0);
+					if (g.hit && std::fabs(g.z - s.sam.pos[2]) < 1.0 && body_free(x, y, g.z))
+					{
+						g_aim[0] = x, g_aim[1] = y, g_aim[2] = g.z;
+						g_hasAim = true;
+						g_strolling = true;
+					}
+				}
+			}
+			if (g_hasAim)
+			{
+				std::copy(g_aim, g_aim + 3, target);
+				pace_cap = (g_strolling ? kStrollPace : kComePace) * g_scale;
+			}
+			else
+				std::copy(a.pos, a.pos + 3, target); // stay
+		}
 		float tx = float(target[0] - a.pos[0]), ty = float(target[1] - a.pos[1]);
 		const float dist = std::sqrt(tx * tx + ty * ty);
+		if (g_hasAim && dist < kArrive + 0.1f)
+			g_hasAim = false; // there
 
 		// stuck: no progress toward her spot for a while although it's far
 		if (dist < g_bestDist - 0.3f)
 		{
 			g_bestDist = dist;
 			g_stuckTime = 0.0f;
+		}
+		else if (g_hasAim)
+		{
+			// a place near Sam she can't get to: give it up, no need to jump anywhere
+			if ((g_stuckTime += dt) > 1.5f)
+				g_hasAim = false, g_stuckTime = 0.0f, g_bestDist = 1e9f;
 		}
 		else if (dist > kStuckDistance)
 		{
@@ -477,9 +550,9 @@ namespace astra
 		}
 
 		// pace: Sam's plus what closes the gap, braking into her spot
-		float want = dist < kArrive ? 0.0f : std::min(kMaxSpeed, g_samSpeed * 0.9f + (dist - kArrive) * 1.4f);
+		float want = dist < kArrive ? 0.0f : std::min(pace_cap, g_samSpeed * 0.9f + (dist - kArrive) * 1.4f);
 		if (want > 0.0f)
-			want = std::max(want, 0.7f);
+			want = std::max(want, 0.7f * g_scale); // no slower than her walk
 		// turn first: she walks the way she faces, slower while she's still turning round
 		if (want > 0.0f)
 		{
@@ -588,6 +661,36 @@ namespace astra
 			g_seatLift = lift, g_seatForward = forward;
 		lift = g_seatLift;
 		forward = g_seatForward;
+	}
+
+	float sunlit(const float toward[3], const void *ignore)
+	{
+		if (!g_state.valid || physics::thread_slot() == 0)
+			return 1.0f;
+		const State a = state();
+		int open = 0, asked = 0;
+		for (const float h : {0.35f, 1.0f, 1.45f})
+		{
+			const double from[3] = {a.pos[0], a.pos[1], a.pos[2] + h * g_scale};
+			const double to[3] = {from[0] + toward[0] * 250.0, from[1] + toward[1] * 250.0, from[2] + toward[2] * 250.0};
+			physics::Hit hit;
+			if (!physics::intersect_line(from, to, physics::layers().ground, ignore, hit))
+				continue;
+			++asked;
+			if (!hit.hit)
+				++open;
+		}
+		return asked ? float(open) / float(asked) : 1.0f;
+	}
+
+	float scale()
+	{
+		return g_scale;
+	}
+
+	void set_scale(float s)
+	{
+		g_scale = std::clamp(s, 0.5f, 2.0f);
 	}
 
 	void call()

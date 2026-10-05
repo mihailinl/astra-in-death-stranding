@@ -40,6 +40,10 @@ namespace layer
 		Pose g_pose; // the camera the shown picture was rendered with
 		unsigned long long g_hostFrame = 0;
 		bool (*g_movedSince)(unsigned long long, double[3]) = nullptr;
+		float g_sunToward[3] = {0, 1, 0}, g_shadow = 0.0f;
+		double g_feet[3] = {};
+		float g_size = 1.0f;
+		constexpr float kHeight = 1.40f; // the built-in character's height at size 1 (measured in her pictures)
 
 		wchar_t g_name[128] = L"Local\\AstraFrame", g_path[260] = L"Z:\\dev\\shm\\astra-frame";
 		HANDLE g_file = INVALID_HANDLE_VALUE, g_mapping = nullptr;
@@ -47,7 +51,19 @@ namespace layer
 		int32_t g_slots = 0;
 		int64_t g_stride = 0, g_lastPublish = -1;
 		DWORD g_nextOpen = 0;
-		Layer g_world, g_depth;
+		Layer g_world, g_depth, g_sunMap;
+		uint32_t g_sunN = 0;
+		// her depth seen from the sun (plane 3, flag 32: "SUNV" header + N x N float32), for her shadow on DS's ground
+		struct SunView
+		{
+			bool valid = false;
+			double center[3] = {};
+			float right[3] = {}, up[3] = {}, dir[3] = {};
+			float half = 1.0f, near_dist = 0.0f;
+		} g_sunView;
+		constexpr int32_t kFlagSunView = 32;
+		constexpr uint32_t kSunMagic = 0x564E5553; // "SUNV"
+		constexpr int kSunHeader = 128;
 		uint32_t g_width = 0, g_height = 0;
 		bool g_hasFrame = false;
 		int32_t g_flags = 24;
@@ -120,7 +136,7 @@ namespace layer
 
 		void destroy_layers(device *dev)
 		{
-			for (Layer *l : {&g_world, &g_depth})
+			for (Layer *l : {&g_world, &g_depth, &g_sunMap})
 			{
 				if (l->srv.handle != 0)
 					dev->destroy_resource_view(l->srv);
@@ -129,6 +145,7 @@ namespace layer
 				*l = Layer();
 			}
 			g_width = g_height = 0;
+			g_sunN = 0;
 			g_hasFrame = false;
 		}
 
@@ -144,6 +161,7 @@ namespace layer
 		{
 			runtime->update_texture_bindings("ASTRAWORLD", g_world.srv, g_world.srv);
 			runtime->update_texture_bindings("ASTRADEPTH", g_depth.srv, g_depth.srv);
+			runtime->update_texture_bindings("ASTRASUN", g_sunMap.srv, g_sunMap.srv);
 		}
 
 		/// The newest published frame, if not shown yet.
@@ -190,8 +208,49 @@ namespace layer
 			dev->update_texture_region(data, g_world.tex, 0);
 			data.data = const_cast<uint8_t *>(base + plane);
 			dev->update_texture_region(data, g_depth.tex, 0);
+			// her depth from the sun, when the engine sends it (plane 3)
+			SunView sv;
+			if ((flags & kFlagSunView) != 0 && (flags & kFlagNoOverlay) == 0)
+			{
+				const uint8_t *p3 = base + 2 * plane;
+				const uint32_t n = read<uint32_t>(p3 + 4);
+				if (read<uint32_t>(p3) == kSunMagic && n >= 16 && n <= 2048 && size_t(kSunHeader) + size_t(n) * n * 4 <= plane)
+				{
+					if (n != g_sunN)
+					{
+						if (g_sunMap.srv.handle != 0)
+							dev->destroy_resource_view(g_sunMap.srv);
+						if (g_sunMap.tex.handle != 0)
+							dev->destroy_resource(g_sunMap.tex);
+						g_sunMap = Layer();
+						g_sunN = 0;
+						if (create_layer(dev, g_sunMap, n, n, format::r32_float))
+							g_sunN = n;
+						bind(runtime);
+					}
+					if (g_sunN == n)
+					{
+						subresource_data sd;
+						sd.row_pitch = n * 4;
+						sd.slice_pitch = n * n * 4;
+						sd.data = const_cast<uint8_t *>(p3 + kSunHeader);
+						dev->update_texture_region(sd, g_sunMap.tex, 0);
+						for (int i = 0; i < 3; ++i)
+						{
+							sv.center[i] = read<double>(p3 + 8 + 8 * i);
+							sv.right[i] = read<float>(p3 + 32 + 4 * i);
+							sv.up[i] = read<float>(p3 + 44 + 4 * i);
+							sv.dir[i] = read<float>(p3 + 56 + 4 * i);
+						}
+						sv.half = read<float>(p3 + 68);
+						sv.near_dist = read<float>(p3 + 72);
+						sv.valid = sv.half > 0.0f;
+					}
+				}
+			}
 			if (read<int64_t>(desc) != seq)
 				return; // rewritten while we copied: the next one
+			g_sunView = sv;
 			g_lastPublish = published;
 			g_near = read<float>(desc + 32);
 			g_far = read<float>(desc + 36);
@@ -291,6 +350,64 @@ namespace layer
 				for (int i = 0; i < 3; ++i)
 					t[i] = rm[0][i] * d[0] + rm[1][i] * d[1] + rm[2][i] * d[2];
 			}
+			// her shadow: the sun's direction and her feet in DS's camera space (camera-to-world rotation transposed)
+			if (host.valid)
+			{
+				float rh[3][3];
+				camera_rotation(host, rh);
+				float sunv[3], feetv[3];
+				double fl[3];
+				float st[3], strength;
+				{
+					std::lock_guard<std::mutex> lock(g_poseLock);
+					std::copy(g_feet, g_feet + 3, fl);
+					std::copy(g_sunToward, g_sunToward + 3, st);
+					strength = g_shadow;
+				}
+				const float fd[3] = {float(fl[0] - host.x), float(fl[1] - host.y), float(fl[2] - host.z)};
+				for (int i = 0; i < 3; ++i)
+				{
+					sunv[i] = rh[0][i] * st[0] + rh[1][i] * st[1] + rh[2][i] * st[2];
+					feetv[i] = rh[0][i] * fd[0] + rh[1][i] * fd[1] + rh[2][i] * fd[2];
+				}
+				set_float3(runtime, "SunView", sunv[0], sunv[1], sunv[2]);
+				set_float3(runtime, "UpView", rh[1][0], rh[1][1], rh[1][2]); // the world's +Y in DS's camera space
+				// her view from the sun, in DS's camera space (moved along with her like her picture)
+				const bool sun_map = g_sunView.valid && g_sunN != 0;
+				if (sun_map)
+				{
+					const SunView &v = g_sunView;
+					const double cw[3] = {v.center[0] + (from.x - g_pose.x), v.center[1] + (from.y - g_pose.y), v.center[2] + (from.z - g_pose.z)};
+					const float cd[3] = {float(cw[0] - host.x), float(cw[1] - host.y), float(cw[2] - host.z)};
+					float c[3], r[3], u[3], d[3];
+					for (int i = 0; i < 3; ++i)
+					{
+						c[i] = rh[0][i] * cd[0] + rh[1][i] * cd[1] + rh[2][i] * cd[2];
+						r[i] = rh[0][i] * v.right[0] + rh[1][i] * v.right[1] + rh[2][i] * v.right[2];
+						u[i] = rh[0][i] * v.up[0] + rh[1][i] * v.up[1] + rh[2][i] * v.up[2];
+						d[i] = rh[0][i] * v.dir[0] + rh[1][i] * v.dir[1] + rh[2][i] * v.dir[2];
+					}
+					set_float3(runtime, "SunVCenter", c[0], c[1], c[2]);
+					set_float3(runtime, "SunVRight", r[0], r[1], r[2]);
+					set_float3(runtime, "SunVUp", u[0], u[1], u[2]);
+					set_float3(runtime, "SunVDir", d[0], d[1], d[2]);
+					set_float3(runtime, "SunVParams", v.half, v.near_dist, float(g_sunN));
+				}
+				if (const effect_uniform_variable uv = runtime->find_uniform_variable(kEffect, "SunVActive"); uv.handle != 0)
+					runtime->set_uniform_value_bool(uv, sun_map);
+				set_float3(runtime, "AstraFeetView", feetv[0], feetv[1], feetv[2]);
+				if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "AstraShadow"); v.handle != 0)
+					runtime->set_uniform_value_float(v, strength);
+				float size;
+				{
+					std::lock_guard<std::mutex> lock(g_poseLock);
+					size = g_size;
+				}
+				if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "AstraHeight"); v.handle != 0)
+					runtime->set_uniform_value_float(v, kHeight * size);
+				if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "AstraSize"); v.handle != 0)
+					runtime->set_uniform_value_float(v, size);
+			}
 			set_float3(runtime, "AstraWarpRow0", m[0][0], m[0][1], m[0][2]);
 			set_float3(runtime, "AstraWarpRow1", m[1][0], m[1][1], m[1][2]);
 			set_float3(runtime, "AstraWarpRow2", m[2][0], m[2][1], m[2][2]);
@@ -363,6 +480,20 @@ namespace layer
 		g_hasFrame = false;
 		g_nextOpen = 0;
 		logf("layer: the engine's frames are at %s", where);
+	}
+
+	void set_sun(const float toward[3], float strength)
+	{
+		std::lock_guard<std::mutex> lock(g_poseLock);
+		std::copy(toward, toward + 3, g_sunToward);
+		g_shadow = strength;
+	}
+
+	void set_feet(const double feet[3], float size)
+	{
+		std::lock_guard<std::mutex> lock(g_poseLock);
+		std::copy(feet, feet + 3, g_feet);
+		g_size = size;
 	}
 
 	unsigned long long frames()

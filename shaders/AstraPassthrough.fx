@@ -9,6 +9,9 @@ texture AstraWorldTex : ASTRAWORLD;
 texture AstraDepthTex : ASTRADEPTH;
 sampler sAstraWorld { Texture = AstraWorldTex; AddressU = CLAMP; AddressV = CLAMP; };
 sampler sAstraDepth { Texture = AstraDepthTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+// her depth seen from the sun (the engine's light view): metres along SunVDir from its near plane, 0 where she isn't
+texture AstraSunTex : ASTRASUN;
+sampler sAstraSun { Texture = AstraSunTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
 // DS's own UI target (bound by the add-ons every frame)
 texture DsUiTex : DSUI;
 sampler sDsUi { Texture = DsUiTex; AddressU = CLAMP; AddressV = CLAMP; };
@@ -33,6 +36,20 @@ uniform float3 AstraWarpRow2 = float3(0.0, 0.0, 1.0);
 uniform float3 AstraWarpT = float3(0.0, 0.0, 0.0);
 uniform float3 AstraWarpTan = float3(0.42, 0.42, 1.7778);
 uniform bool DsUiActive = false;
+// her shadow: toward the sun and her feet in DS's camera space, and how dark it may be (0: no sun on her)
+uniform float3 SunView = float3(0.0, 1.0, 0.0);
+uniform float3 AstraFeetView = float3(0.0, 0.0, -5.0);
+uniform float3 UpView = float3(0.0, 1.0, 0.0); // the world's up in DS's camera space
+uniform float AstraHeight = 1.68; // her height (m, with her size)
+// the sun view, in DS's camera space: centre, right (+u), up (+v), the way the light travels; half width, near, N
+uniform bool SunVActive = false;
+uniform float3 SunVCenter = float3(0.0, 0.0, -5.0);
+uniform float3 SunVRight = float3(1.0, 0.0, 0.0);
+uniform float3 SunVUp = float3(0.0, 1.0, 0.0);
+uniform float3 SunVDir = float3(0.0, -1.0, 0.0);
+uniform float3 SunVParams = float3(1.0, 0.0, 512.0);
+uniform float AstraSize = 1.2;
+uniform float AstraShadow = 0.0;
 
 uniform float DepthBias < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.005; ui_label = "Depth bias (m)";
 	ui_tooltip = "How far behind DS's surface she may still show (her feet on the ground)."; > = 0.04;
@@ -49,6 +66,9 @@ uniform float HazeDistance < ui_type = "drag"; ui_min = 10.0; ui_max = 1000.0; u
 uniform float HazeStrength < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Haze strength"; > = 0.85;
 uniform float DsUiGamma < ui_type = "drag"; ui_min = 0.2; ui_max = 3.0; ui_step = 0.01; ui_label = "DS UI gamma"; > = 1.0;
 uniform float DsUiStrength < ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.01; ui_label = "DS UI brightness"; > = 1.0;
+uniform float ShadowStrength < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Her shadow";
+	ui_tooltip = "How dark her shadow on DS's ground is in full sun."; > = 0.5;
+uniform float ShadowReach < ui_type = "drag"; ui_min = 1.0; ui_max = 20.0; ui_step = 0.1; ui_label = "Shadow length limit (m)"; > = 10.0;
 uniform int DebugView < ui_type = "combo"; ui_items = "Composite\0Her depth (1 m bands)\0DS depth (1 m bands)\0"; > = 0;
 
 float src_linear(float d, float3 planes)
@@ -152,6 +172,50 @@ float3 relight(float3 c, float2 uv, float z)
 	return lerp(c, tex2Dlod(sAstraLight, float4(uv, 0, LightBlur + 1.0)).rgb, h);
 }
 
+/// Her shadow without a view of her from the sun: her body as a capsule (her height, upright at her feet), and the
+/// sun ray from this DS surface point (DS camera space) passing it: the nearer the ray passes her axis, the darker,
+/// softer the further the shadow falls. The same from any camera.
+float her_shadow(float3 p)
+{
+	const float3 up = normalize(UpView);
+	const float r = 0.17 * AstraSize;
+	const float3 a = AstraFeetView + up * r, b = AstraFeetView + up * max(AstraHeight - r, r);
+	// closest approach between the ray p + SunView t (t > 0) and the segment a..b
+	const float3 d1 = SunView, d2 = b - a, w = p - a;
+	const float aa = dot(d1, d1), bb = dot(d1, d2), cc = dot(d2, d2), dd = dot(d1, w), ee = dot(d2, w);
+	const float den = aa * cc - bb * bb;
+	float s = den > 1e-6 ? (bb * ee - cc * dd) / den : 0.0;
+	float u = den > 1e-6 ? (aa * ee - bb * dd) / den : 0.0;
+	u = saturate(u);
+	s = max((bb * u - dd) / aa, 0.0); // the ray's point nearest to the clamped axis point
+	if (s > ShadowReach)
+		return 0.0;
+	const float dist = length(p + d1 * s - (a + d2 * u));
+	const float soft = 0.05 + 0.04 * s;
+	return (1.0 - smoothstep(r - soft, r + soft, dist)) * (1.0 - saturate((s / ShadowReach - 0.7) * 3.3));
+}
+
+/// Her real shadow: this DS surface point in the engine's view of her from the sun; shadowed where it lies further
+/// along the light than her surface there (3x3 taps soften the edge).
+float her_shadow_map(float3 p)
+{
+	const float3 d = p - SunVCenter;
+	const float2 uv = float2(dot(d, SunVRight), dot(d, SunVUp)) / SunVParams.x;
+	if (any(abs(uv) > 1.0))
+		return 0.0;
+	const float depth = dot(d, SunVDir) + SunVParams.y;
+	const float2 tc = float2(uv.x * 0.5 + 0.5, 0.5 - uv.y * 0.5);
+	const float texel = 1.0 / SunVParams.z;
+	float shadow = 0.0;
+	[unroll] for (int y = -1; y <= 1; ++y)
+		[unroll] for (int x = -1; x <= 1; ++x)
+		{
+			const float z = tex2Dlod(sAstraSun, float4(tc + float2(x, y) * texel * 1.5, 0, 0)).r;
+			shadow += z > 0.0 && depth > z + 0.04 ? 1.0 : 0.0;
+		}
+	return shadow / 9.0;
+}
+
 float4 PS_Light(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
 	return float4(tex2D(ReShade::BackBuffer, uv).rgb, 1.0);
@@ -183,7 +247,15 @@ float3 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 			visible = 0.0;
 	}
 	const float cover = astra.a * visible;
-	float3 c = (visible > 0.0 ? relight(astra.rgb, uv, za) : 0.0) + host * (1.0 - cover);
+	// her shadow on DS's surfaces around her (where she doesn't cover them herself)
+	float3 shaded = host;
+	if (AstraShadow > 0.0 && ShadowStrength > 0.0 && cover < 0.999 && zh < 200.0)
+	{
+		const float3 p = float3((uv.x * 2.0 - 1.0) * AstraWarpTan.x * BUFFER_WIDTH * BUFFER_RCP_HEIGHT, (1.0 - uv.y * 2.0) * AstraWarpTan.x, -1.0) * zh;
+		if (distance(p, AstraFeetView) < ShadowReach + 2.0)
+			shaded = host * (1.0 - ShadowStrength * AstraShadow * (SunVActive ? her_shadow_map(p) : her_shadow(p)));
+	}
+	float3 c = (visible > 0.0 ? relight(astra.rgb, uv, za) : 0.0) + shaded * (1.0 - cover);
 	// DS's UI back over her (DS composited it with its scene before she was drawn over that)
 	if (DsUiActive && cover > 0.001)
 	{

@@ -28,6 +28,13 @@ namespace astralink
 		uint32_t g_viewSent = 0;
 		int g_viewW = 1920, g_viewH = 1080;
 		bool g_seated = false;
+		ULONGLONG g_nextLight = 0;
+		constexpr ULONGLONG kLightEveryMs = 100;
+		constexpr float kNoonSun = 2.1e6f; // DS's daylight sun: intensity 2.0e6 x colour 1.05 (measured, afternoon, clear)
+		ULONGLONG g_paramTick = 0;
+		double g_prevPos[3] = {};
+		float g_speed = 0.0f, g_airTime = 0.0f, g_scale = 0.0f;
+		constexpr float kAirborneAfter = 0.18f; // seconds falling before she's "in the air" for the animations
 		unsigned long long g_seatedAt = 0;
 		constexpr unsigned long long kSitDownMs = 1300; // the engine's seat_in clip
 		unsigned long long g_frame = 0;
@@ -183,14 +190,31 @@ namespace astralink
 		dir_to_gl(a.fwd, face);
 		dir_to_gl(a.up, her_up);
 		dir_to_gl(a.vel, vel);
-		const float ground_speed = std::sqrt(a.vel[0] * a.vel[0] + a.vel[1] * a.vel[1]);
+		// animator parameters, raw but steady: her pace over the ground smoothed (per-frame displacement is noisy,
+		// and a jump back to Sam isn't a sprint), and "in the air" only after a moment off the ground (a one-frame
+		// drop on rough ground would be a hop and a landing crouch)
+		const ULONGLONG now = GetTickCount64();
+		const float dt = g_paramTick ? std::min(float(now - g_paramTick) * 0.001f, 0.1f) : 0.0f;
+		g_paramTick = now;
+		const double jump = std::hypot(a.pos[0] - g_prevPos[0], a.pos[1] - g_prevPos[1]);
+		std::copy(a.pos, a.pos + 3, g_prevPos);
+		const float raw_speed = std::sqrt(a.vel[0] * a.vel[0] + a.vel[1] * a.vel[1]);
+		if (jump > 2.0 || a.seated)
+			g_speed = 0.0f;
+		else
+			g_speed += (std::min(raw_speed, 12.0f) - g_speed) * std::min(1.0f, dt * 10.0f);
+		const float ground_speed = g_speed < 0.05f ? 0.0f : g_speed;
+		g_airTime = a.gait == astra::Gait::fall ? g_airTime + dt : 0.0f;
+		const bool airborne = g_airTime > kAirborneAfter;
+		// her size eases to the slider's (the engine applies it at once)
+		g_scale = g_scale <= 0.0f ? astra::scale() : g_scale + (astra::scale() - g_scale) * std::min(1.0f, dt * 4.0f);
 		// sitting down: her feet stay where they are while the sit-down clip plays, then her hips go onto the seat
 		// (the engine eases between the two)
 		const bool hips = a.seated && GetTickCount64() - g_seatedAt > kSitDownMs;
 		sendf("{\"t\":\"avatar\",\"id\":0,\"pos\":[%.4f,%.4f,%.4f],\"fwd\":[%.5f,%.5f,%.5f],\"up\":[%.5f,%.5f,%.5f],\"vel\":[%.3f,%.3f,%.3f],"
-			  "\"params\":{\"speed\":%.3f,\"airborne\":%s,\"vspeed\":%.3f,\"seated\":%s}%s}",
-			feet[0], feet[1], feet[2], face[0], face[1], face[2], her_up[0], her_up[1], her_up[2], vel[0], vel[1], vel[2], a.seated ? 0.0f : ground_speed,
-			a.gait == astra::Gait::fall ? "true" : "false", a.vel[2], a.seated ? "true" : "false",
+			  "\"scale\":%.3f,\"params\":{\"speed\":%.3f,\"airborne\":%s,\"vspeed\":%.3f,\"seated\":%s}%s}",
+			feet[0], feet[1], feet[2], face[0], face[1], face[2], her_up[0], her_up[1], her_up[2], vel[0], vel[1], vel[2], g_scale, a.seated ? 0.0f : ground_speed,
+			airborne ? "true" : "false", a.vel[2], a.seated ? "true" : "false",
 			hips ? ",\"anchor\":\"hips\"" : ""); // seated, pos is the seat: her hips go there
 		// riding with Sam: she sits down on a chair-like seat ("seat": the engine's sitting-on-a-chair state) and
 		// stands up again ("unseat": its stand-up clip, then the graph's own states) when he gets out
@@ -222,6 +246,23 @@ namespace astralink
 			std::copy(feet, feet + 3, h.pos);
 			g_latest = h;
 		}
+		layer::set_feet(feet, g_scale > 0.0f ? g_scale : astra::scale());
+	}
+
+	void set_light(bool valid, const float toward_ds[3], const float color[3], float intensity, float visible)
+	{
+		if (!g_ws.connected() || !valid)
+			return;
+		const ULONGLONG now = GetTickCount64();
+		if (now < g_nextLight)
+			return;
+		g_nextLight = now + kLightEveryMs;
+		float dir[3];
+		dir_to_gl(toward_ds, dir);
+		// colour as a hue (max channel 1) and a brightness relative to DS's noon sun
+		const float m = std::max({color[0], color[1], color[2], 1e-6f});
+		sendf("{\"t\":\"light\",\"sun\":{\"dir\":[%.4f,%.4f,%.4f],\"color\":[%.3f,%.3f,%.3f],\"intensity\":%.3f,\"visible\":%.2f}}", dir[0], dir[1], dir[2],
+			color[0] / m, color[1] / m, color[2] / m, intensity * m / kNoonSun, visible);
 	}
 
 	bool moved_since(unsigned long long frame, double out[3])

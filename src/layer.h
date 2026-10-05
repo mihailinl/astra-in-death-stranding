@@ -20,6 +20,11 @@ namespace layer
 	/// Where the engine says its frames are ("/dev/shm/astra-frame" or "Local\\AstraFrame"); reopened if it changed.
 	/// (Present thread only.)
 	void set_frames_at(const char *where);
+	/// The sun for her shadow on DS's ground: toward it (engine coordinates, unit) and how dark her shadow is (0: none:
+	/// night, the sun down, or she's in shade herself).
+	void set_sun(const float toward[3], float strength);
+	/// Her feet (engine coordinates) and her size: her shadow is cast from them.
+	void set_feet(const double feet[3], float size);
 	/// Frames uploaded so far.
 	unsigned long long frames();
 }
