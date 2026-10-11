@@ -69,6 +69,8 @@ namespace layer
 		int32_t g_flags = 24;
 		float g_near = 0.05f, g_far = 300.0f;
 		std::atomic<unsigned long long> g_frames{0};
+		std::atomic<unsigned long long> g_wantFrame{0}, g_waitTimeouts{0};
+		std::atomic<float> g_waitMs{6.0f};
 
 		template <typename T>
 		T read(const uint8_t *p)
@@ -297,11 +299,41 @@ namespace layer
 				runtime->set_uniform_value_float(v, x, y, z);
 		}
 
+		/// Her picture for the camera just sent is a millisecond or two away: wait for it (bounded) instead of
+		/// re-projecting an older one, so she sits exactly on this frame.
+		void wait_for_frame()
+		{
+			const unsigned long long want = g_wantFrame;
+			const float budget = g_waitMs;
+			if (want == 0 || budget <= 0.0f || g_view == nullptr)
+				return;
+			LARGE_INTEGER f, t0, t;
+			QueryPerformanceFrequency(&f);
+			QueryPerformanceCounter(&t0);
+			for (;;)
+			{
+				const int32_t slot = read<int32_t>(g_view + 40);
+				if (slot >= 0 && slot < g_slots && read<uint64_t>(g_view + kSlotDesc + kSlotDescBytes * slot + 16) >= want)
+					break;
+				QueryPerformanceCounter(&t);
+				if (float(t.QuadPart - t0.QuadPart) * 1000.0f / float(f.QuadPart) > budget)
+				{
+					++g_waitTimeouts;
+					break;
+				}
+				YieldProcessor();
+				SwitchToThread();
+			}
+		}
+
 		void on_begin_effects(effect_runtime *runtime, command_list *, resource_view, resource_view)
 		{
 			bool on = g_active && open_mapping();
 			if (on)
+			{
+				wait_for_frame();
 				upload(runtime);
+			}
 			on = on && g_hasFrame;
 			// the technique is always enabled (annotation); AstraActive gates it
 			if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "AstraActive"); v.handle != 0)
@@ -408,6 +440,12 @@ namespace layer
 				if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "AstraSize"); v.handle != 0)
 					runtime->set_uniform_value_float(v, size);
 			}
+			// her picture was drawn from this very camera (she hasn't moved since either): no re-projection at all
+			const bool identity = host.valid && std::fabs(host.yaw - from.yaw) < 1e-3f && std::fabs(host.pitch - from.pitch) < 1e-3f &&
+				std::fabs(host.roll - from.roll) < 1e-3f && std::fabs(host.fov - from.fov) < 1e-3f && std::fabs(host.x - from.x) < 1e-4 &&
+				std::fabs(host.y - from.y) < 1e-4 && std::fabs(host.z - from.z) < 1e-4;
+			if (const effect_uniform_variable v = runtime->find_uniform_variable(kEffect, "AstraWarpIdentity"); v.handle != 0)
+				runtime->set_uniform_value_bool(v, identity);
 			set_float3(runtime, "AstraWarpRow0", m[0][0], m[0][1], m[0][2]);
 			set_float3(runtime, "AstraWarpRow1", m[1][0], m[1][1], m[1][2]);
 			set_float3(runtime, "AstraWarpRow2", m[2][0], m[2][1], m[2][2]);
@@ -494,6 +532,23 @@ namespace layer
 		std::lock_guard<std::mutex> lock(g_poseLock);
 		std::copy(feet, feet + 3, g_feet);
 		g_size = size;
+	}
+
+	void expect_frame(unsigned long long cam_id)
+	{
+		g_wantFrame = cam_id;
+	}
+
+	float &wait_ms()
+	{
+		static float v = 6.0f;
+		g_waitMs = v;
+		return v;
+	}
+
+	unsigned long long wait_timeouts()
+	{
+		return g_waitTimeouts;
 	}
 
 	unsigned long long frames()

@@ -3,15 +3,27 @@
 # install.sh does, or ReShade's own installer with full add-on support).
 #   ./install.sh            astra.addon64 + AstraPassthrough.fx (its technique enables itself: no preset changes)
 #   ./install.sh --remove   takes them out again
+#   ./install.sh --ds2 ...  the same for Death Stranding 2
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
-MC="$HERE/extern/minecraft-in-death-stranding"
-GAME=${DS_DIR:-$("$MC/tools/find_ds.sh")}
-MANIFEST="$HERE/installed.txt"
+MC=${MC_DIR:-$HERE/extern/minecraft-in-death-stranding}
+GAME_ID=1; REMOVE=0
+for a in "$@"; do
+	case "$a" in
+		--ds2) GAME_ID=2 ;;
+		--remove) REMOVE=1 ;;
+		*) echo "unknown option $a"; exit 1 ;;
+	esac
+done
+if [ $GAME_ID = 2 ]; then
+	GAME=${DS_DIR:-$("$MC/tools/find_ds.sh" 2)}; EXE=DS2.exe; MANIFEST="$HERE/installed-ds2.txt"
+else
+	GAME=${DS_DIR:-$("$MC/tools/find_ds.sh")}; EXE=ds.exe; MANIFEST="$HERE/installed.txt"
+fi
 
-[ -f "$GAME/ds.exe" ] || { echo "ds.exe not found in $GAME (set DS_DIR)"; exit 1; }
+[ -f "$GAME/$EXE" ] || { echo "$EXE not found in $GAME (set DS_DIR)"; exit 1; }
 
-if [ "$1" = --remove ]; then
+if [ $REMOVE = 1 ]; then
 	[ -f "$MANIFEST" ] || { echo "nothing recorded in $MANIFEST"; exit 0; }
 	while IFS= read -r rel; do rm -f -- "$GAME/$rel"; done < "$MANIFEST"
 	rm -f "$MANIFEST"

@@ -1,4 +1,5 @@
 #include "sun.h"
+#include "game.h"
 #include "guard.h"
 #include "log.h"
 #include <windows.h>
@@ -13,8 +14,18 @@ namespace sun
 {
 	namespace
 	{
-		constexpr uintptr_t kSunLightVtbl = 0x3c07790; // SunLight's vtable rva (its RTTI's GetRTTI getter, Steam build 13300582)
-		constexpr size_t kTransform = 0x20, kColor = 0x16C, kIntensity = 0x178, kEnable = 0x24A;
+		// SunLight: vtable rva (its RTTI's GetRTTI getter), Light's colour, intensity and enable, the WorldNode transform
+		struct Layout
+		{
+			uintptr_t vtbl;
+			size_t transform, color, intensity, enable;
+		};
+		constexpr Layout kDS1 = {0x3c07790, 0x20, 0x16C, 0x178, 0x24A}; // Death Stranding DC, Steam build 13300582
+		constexpr Layout kDS2 = {0x341DA70, 0x20, 0x1D4, 0x1E0, 0x2E8}; // Death Stranding 2 (RTTI dump)
+		const Layout &L()
+		{
+			return game::version() == 2 ? kDS2 : kDS1;
+		}
 		constexpr ULONGLONG kRescanMs = 10000;
 
 		std::atomic<uintptr_t> g_sun{0};
@@ -37,11 +48,11 @@ namespace sun
 		{
 			return guard::run("sun read", [&] {
 				r.vtbl = *reinterpret_cast<const uintptr_t *>(p);
-				std::memcpy(r.pos, reinterpret_cast<const void *>(p + kTransform), sizeof(r.pos));
-				std::memcpy(r.col, reinterpret_cast<const void *>(p + kTransform + 24), sizeof(r.col));
-				std::memcpy(r.color, reinterpret_cast<const void *>(p + kColor), sizeof(r.color));
-				std::memcpy(&r.intensity, reinterpret_cast<const void *>(p + kIntensity), sizeof(r.intensity));
-				r.enable = *reinterpret_cast<const uint8_t *>(p + kEnable);
+				std::memcpy(r.pos, reinterpret_cast<const void *>(p + L().transform), sizeof(r.pos));
+				std::memcpy(r.col, reinterpret_cast<const void *>(p + L().transform + 24), sizeof(r.col));
+				std::memcpy(r.color, reinterpret_cast<const void *>(p + L().color), sizeof(r.color));
+				std::memcpy(&r.intensity, reinterpret_cast<const void *>(p + L().intensity), sizeof(r.intensity));
+				r.enable = *reinterpret_cast<const uint8_t *>(p + L().enable);
 			});
 		}
 
@@ -67,7 +78,7 @@ namespace sun
 		void scan()
 		{
 			const uintptr_t base = uintptr_t(GetModuleHandleW(nullptr));
-			const uintptr_t want = base + kSunLightVtbl;
+			const uintptr_t want = base + L().vtbl;
 			std::vector<uintptr_t> found;
 			unsigned long long bytes = 0;
 			MEMORY_BASIC_INFORMATION mbi;
@@ -127,7 +138,7 @@ namespace sun
 		State s{};
 		const uintptr_t p = g_sun;
 		Raw r;
-		if (p == 0 || !read_raw(p, r) || r.vtbl != uintptr_t(GetModuleHandleW(nullptr)) + kSunLightVtbl || !plausible(r))
+		if (p == 0 || !read_raw(p, r) || r.vtbl != uintptr_t(GetModuleHandleW(nullptr)) + L().vtbl || !plausible(r))
 		{
 			// none yet, or it went away (a new area): look again now and then
 			if (!g_scanning && GetTickCount64() >= g_nextScan)

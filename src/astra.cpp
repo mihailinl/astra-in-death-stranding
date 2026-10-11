@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <windows.h>
 
 namespace astra
@@ -64,6 +65,7 @@ namespace astra
 		LARGE_INTEGER g_prevTick{}, g_freq{};
 		const void *g_ignore = nullptr; // Sam (and his cargo): the ground rays see characters
 		Stats g_stats{};
+		std::recursive_mutex g_lock;
 
 		const float kTwoPi = 6.2831853f;
 
@@ -220,13 +222,17 @@ namespace astra
 			Ride kind;
 			game::WorldTransform t;
 		};
+		// Death Stranding DC; Death Stranding 2 (from its RTTI dump: DSVehicleTruck, DSVehicleMotorbike; no roadster)
 		constexpr uintptr_t kTruckVtbl = 0x3e26790, kTrikeVtbl = 0x3e25db8, kRoadsterVtbl = 0x3e274d8;
+		constexpr uintptr_t kTruckVtbl2 = 0x33AF800, kTrikeVtbl2 = 0x33AB6B8;
 		constexpr int kRideConfirm = 3, kRideLose = 6; // probes in a row (every third frame)
 
 		Ride ride_kind(void *entity)
 		{
 			// (inside guard::run: a stale pointer is contained)
 			const uintptr_t vt = *reinterpret_cast<const uintptr_t *>(entity) - uintptr_t(GetModuleHandleW(nullptr));
+			if (game::version() == 2)
+				return vt == kTruckVtbl2 ? Ride::truck : vt == kTrikeVtbl2 ? Ride::trike : Ride::none;
 			return vt == kTruckVtbl ? Ride::truck : vt == kTrikeVtbl ? Ride::trike : vt == kRoadsterVtbl ? Ride::roadster : Ride::none;
 		}
 
@@ -240,7 +246,7 @@ namespace astra
 		bool vehicle_under_sam(const game::Snapshot &s, Vehicle &out)
 		{
 			const void *sam = reinterpret_cast<const void *>(s.sam_ptr);
-			for (const uint32_t layer : {physics::kLayerHumanoidRaycast, 12u, physics::kLayerPlayerLegIK})
+			for (const uint32_t layer : {physics::kLayerHumanoidRaycast, 12u, physics::layer_leg_ik()})
 				for (const double above : {1.0, 2.0, 3.0})
 				{
 					const double from[3] = {s.sam.pos[0], s.sam.pos[1], s.sam.pos[2] + above}, to[3] = {s.sam.pos[0], s.sam.pos[1], s.sam.pos[2] - 1.5};
@@ -258,7 +264,7 @@ namespace astra
 						continue;
 					out.entity = h.entity;
 					out.kind = kind;
-					std::memcpy(&out.t, static_cast<const char *>(h.entity) + 200, sizeof(out.t)); // Entity::Orientation
+					std::memcpy(&out.t, static_cast<const char *>(h.entity) + game::entity_orientation(), sizeof(out.t)); // Entity::Orientation
 					if (!std::isfinite(out.t.pos[0]) || !std::isfinite(out.t.pos[2]))
 						return false;
 					// Sam inside it, in its seat, not climbing in beside it (a truck's side overhangs him then)
@@ -302,6 +308,8 @@ namespace astra
 
 	void frame(const game::Snapshot &s)
 	{
+		// (in Death Stranding 2 this runs on the game's update thread while state() is read on the Present thread)
+		std::lock_guard<std::recursive_mutex> lock(g_lock);
 		LARGE_INTEGER now;
 		QueryPerformanceCounter(&now);
 		if (g_freq.QuadPart == 0)
@@ -378,7 +386,7 @@ namespace astra
 		{
 			// the vehicle moves every frame: its transform now, her seat in it
 			game::WorldTransform t;
-			std::memcpy(&t, static_cast<const char *>(g_vehicle.entity) + 200, sizeof(t));
+			std::memcpy(&t, static_cast<const char *>(g_vehicle.entity) + game::entity_orientation(), sizeof(t));
 			if (std::isfinite(t.pos[0]))
 				g_vehicle.t = t;
 			double seat[3];
@@ -630,6 +638,7 @@ namespace astra
 
 	State state()
 	{
+		std::lock_guard<std::recursive_mutex> lock(g_lock);
 		State s = g_state;
 		if (!s.seated)
 		{

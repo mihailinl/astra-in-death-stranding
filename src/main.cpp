@@ -19,6 +19,7 @@
 #include <windows.h>
 #include <cstdarg>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 
 using namespace reshade::api;
@@ -54,9 +55,60 @@ namespace
 		}
 	}
 
+	// When DS's camera is read and her camera goes to the engine: at the start of the Present, before ReShade renders
+	// its effects (so her picture is re-projected onto the camera being presented, and the engine gets it soonest), or,
+	// as before, after them (reshade_present: her picture then lands on the previous frame's camera). Overlay switch.
+	bool g_earlyCamera = true;
+	uint32_t g_bbWidth = 0, g_bbHeight = 0;
+
+	void per_frame(uint32_t w, uint32_t h);
+
+	// Death Stranding 2: once per game frame on its update thread (physics::install_tick): her walking and how much of
+	// her is in the sun, from a snapshot of its own
+	game::Snapshot g_tickSnap;
+	sun::State g_tickSun{};
+	std::atomic<float> g_tickLit{1.0f};
+	ULONGLONG g_tickPausedUntil = 0;
+
+	void game_tick()
+	{
+		if (!g_resolved || g_followBroken || GetTickCount64() < g_tickPausedUntil)
+			return;
+		if (!guard::run("game tick: camera read", [] { game::read(g_tickSnap); }) || !g_tickSnap.ok)
+		{
+			g_tickPausedUntil = GetTickCount64() + 2000;
+			return;
+		}
+		if (!guard::run("Astra follows Sam", [] { astra::frame(g_tickSnap); }))
+		{
+			g_followBroken = true;
+			return;
+		}
+		const sun::State sunst = g_tickSun;
+		if (sunst.valid)
+		{
+			float lit = 1.0f;
+			guard::run("Astra in the sun", [&] { lit = astra::sunlit(sunst.toward, reinterpret_cast<const void *>(g_tickSnap.sam_ptr)); });
+			g_tickLit = lit;
+		}
+	}
+
 	void on_present(effect_runtime *runtime)
 	{
 		++g_frame;
+		runtime->get_screenshot_width_and_height(&g_bbWidth, &g_bbHeight);
+		if (!g_earlyCamera)
+			per_frame(g_bbWidth, g_bbHeight);
+	}
+
+	void on_present_early(command_queue *, swapchain *, const rect *, const rect *, uint32_t, const rect *)
+	{
+		if (g_earlyCamera)
+			per_frame(g_bbWidth, g_bbHeight);
+	}
+
+	void per_frame(uint32_t w, uint32_t h)
+	{
 		if (!g_resolved)
 			return;
 		static bool started = false;
@@ -68,20 +120,31 @@ namespace
 		read_snapshot();
 		if (g_snap.ok && g_snap.near_plane > 0.0f && g_snap.far_plane > g_snap.near_plane)
 			layer::set_host_planes(g_snap.near_plane, g_snap.far_plane);
-		// her walking calls into the game: a fault switches it off instead of letting DS's crash handler end the game
-		if (!g_followBroken && !guard::run("Astra follows Sam", [] { astra::frame(g_snap); }))
+		// her walking calls into the game: a fault switches it off instead of letting DS's crash handler end the game.
+		// Death Stranding 2 answers physics queries only on its own update thread: there it runs in game_tick()
+		const bool ds2 = game::version() == 2;
+		if (ds2)
+		{
+			static bool hooked = false;
+			if (!hooked)
+			{
+				hooked = true;
+				logf("DS2 game tick hook: %s", physics::install_tick(game_tick) ? "installed" : "FAILED (code mismatch)");
+			}
+		}
+		else if (!g_followBroken && !guard::run("Astra follows Sam", [] { astra::frame(g_snap); }))
 			g_followBroken = true;
-		uint32_t w = 0, h = 0;
-		runtime->get_screenshot_width_and_height(&w, &h);
-		astralink::frame(g_snap, int(w), int(h));
 
 		// DS's sun (or moon): her light in the engine, and her shadow on DS's ground
 		g_sun = sun::read();
-		float lit = 1.0f;
-		if (g_sun.valid && g_snap.ok && !g_followBroken)
+		g_tickSun = g_sun;
+		float lit = ds2 ? g_tickLit.load() : 1.0f;
+		if (!ds2 && g_sun.valid && g_snap.ok && !g_followBroken)
 			guard::run("Astra in the sun", [&] { lit = astra::sunlit(g_sun.toward, reinterpret_cast<const void *>(g_snap.sam_ptr)); });
 		g_lit += (lit - g_lit) * 0.15f;
 		astralink::set_light(g_sun.valid, g_sun.toward, g_sun.color, g_sun.intensity, g_lit);
+		// the frame's cam goes last: the engine renders the moment it reads it (anything after lands on the next frame)
+		astralink::frame(g_snap, int(w), int(h));
 		const float toward_gl[3] = {g_sun.toward[0], g_sun.toward[2], -g_sun.toward[1]};
 		// her shadow: while the light is up (it fades as it sets) and she stands in it
 		const float up = g_sun.valid ? std::clamp(g_sun.toward[2] * 5.0f, 0.0f, 1.0f) : 0.0f;
@@ -109,6 +172,12 @@ namespace
 			ls.received, ls.frames);
 		if (const char *ev = astralink::last_event(); ev[0])
 			ImGui::TextDisabled("last: %s", ev);
+		ImGui::Checkbox("Camera of this frame (off: the previous one)", &g_earlyCamera);
+		ImGui::SameLine();
+		ImGui::SetNextItemWidth(140);
+		ImGui::SliderFloat("wait for her picture", &layer::wait_ms(), 0.0f, 12.0f, "%.1f ms");
+		ImGui::SameLine();
+		ImGui::TextDisabled("(late %llu times)", layer::wait_timeouts());
 		bool on = astra::enabled();
 		if (ImGui::Checkbox("Astra follows Sam", &on))
 			astra::set_enabled(on);
@@ -188,10 +257,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 		logf("%s", g_physStatus);
 		ui::install(); // DS's UI over her (unless another of our add-ons already does it for every effect)
 		layer::install();
+		reshade::register_event<reshade::addon_event::present>(on_present_early);
 		reshade::register_event<reshade::addon_event::reshade_present>(on_present);
 		reshade::register_overlay("Astra", on_overlay);
 		break;
 	case DLL_PROCESS_DETACH:
+		physics::uninstall_tick();
 		if (reserved == nullptr) // FreeLibrary; on process exit the link thread is already gone, joining would hang
 			astralink::stop();
 		ui::uninstall();

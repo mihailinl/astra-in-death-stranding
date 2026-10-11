@@ -6,7 +6,7 @@
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 X=${XWIN:-$HOME/.xwin}
-MC="$HERE/extern/minecraft-in-death-stranding"
+MC=${MC_DIR:-$HERE/extern/minecraft-in-death-stranding} # MC_DIR: a local checkout instead (unpushed shared changes)
 TP="$MC/third_party"
 [ -f "$TP/reshade-include/reshade.hpp" ] || { echo "run $MC/tools/fetch_deps.sh first"; exit 1; }
 mkdir -p "$HERE/build"

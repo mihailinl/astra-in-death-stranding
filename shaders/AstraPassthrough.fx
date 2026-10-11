@@ -5,6 +5,10 @@
 // Always enabled (annotation): AstraActive gates it, so DS passes through untouched while she isn't out.
 #include "ReShade.fxh"
 
+// The part of DS's depth buffer the scene was drawn into (set by the add-on: under upscaling, e.g. FSR in
+// Death Stranding 2, the scene is rendered smaller into the top-left of a full-size buffer); 1 at native resolution
+uniform float2 DepthUvScale = float2(1.0, 1.0);
+
 texture AstraWorldTex : ASTRAWORLD;
 texture AstraDepthTex : ASTRADEPTH;
 sampler sAstraWorld { Texture = AstraWorldTex; AddressU = CLAMP; AddressV = CLAMP; };
@@ -18,6 +22,20 @@ sampler sDsUi { Texture = DsUiTex; AddressU = CLAMP; AddressV = CLAMP; };
 // Minecraft's coverage (x) and depth (y) per pixel, written by MCPassthrough.fx (the same texture: same name)
 texture McInfoTex { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA16F; };
 sampler sMcInfo { Texture = McInfoTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+// DS's fog, read off its own picture (dark channel prior): per cell of a coarse grid, an upper bound of the fog's
+// density from how washed out the darkest detail is at that depth, and the haziest colours (the fog's colour)
+#define FOG_W 64
+#define FOG_H 36
+texture FogSigmaTex { Width = FOG_W; Height = FOG_H; Format = R32F; };
+sampler sFogSigma { Texture = FogSigmaTex; MinFilter = POINT; MagFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+texture FogColourTex { Width = FOG_W; Height = FOG_H; Format = RGBA16F; MipLevels = 7; };
+sampler sFogColour { Texture = FogColourTex; AddressU = CLAMP; AddressV = CLAMP; };
+// x: density (1/m), yzw: the fog's colour; smoothed over frames (FogPrevTex: last frame's)
+texture FogParamsTex { Width = 1; Height = 1; Format = RGBA16F; };
+sampler sFogParams { Texture = FogParamsTex; MinFilter = POINT; MagFilter = POINT; };
+texture FogPrevTex { Width = 1; Height = 1; Format = RGBA16F; };
+sampler sFogPrev { Texture = FogPrevTex; MinFilter = POINT; MagFilter = POINT; };
+
 // DS's picture at quarter size with mips: the light around her
 texture AstraLightTex { Width = BUFFER_WIDTH / 4; Height = BUFFER_HEIGHT / 4; Format = RGBA8; MipLevels = 7; };
 sampler sAstraLight { Texture = AstraLightTex; AddressU = CLAMP; AddressV = CLAMP; };
@@ -34,6 +52,7 @@ uniform float3 AstraWarpRow0 = float3(1.0, 0.0, 0.0);
 uniform float3 AstraWarpRow1 = float3(0.0, 1.0, 0.0);
 uniform float3 AstraWarpRow2 = float3(0.0, 0.0, 1.0);
 uniform float3 AstraWarpT = float3(0.0, 0.0, 0.0);
+uniform bool AstraWarpIdentity = false; // her picture is of this very camera: no re-projection
 uniform float3 AstraWarpTan = float3(0.42, 0.42, 1.7778);
 uniform bool DsUiActive = false;
 // her shadow: toward the sun and her feet in DS's camera space, and how dark it may be (0: no sun on her)
@@ -63,12 +82,16 @@ uniform float LightBlur < ui_type = "drag"; ui_min = 1.0; ui_max = 6.0; ui_step 
 uniform float GradeMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Match DS colour grade"; > = 0.25;
 uniform float HazeStart < ui_type = "drag"; ui_min = 0.0; ui_max = 200.0; ui_step = 1.0; ui_label = "Haze start (m)"; > = 15.0;
 uniform float HazeDistance < ui_type = "drag"; ui_min = 10.0; ui_max = 1000.0; ui_step = 1.0; ui_label = "Haze distance (m)"; > = 160.0;
-uniform float HazeStrength < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Haze strength"; > = 0.85;
+uniform float HazeStrength < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Haze strength (fixed haze, when DS's fog isn't measured)"; > = 0.0;
+uniform float FogMatch < ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.01; ui_label = "Match DS's fog";
+	ui_tooltip = "Her fog by DS's own: its colour and density measured from DS's picture every frame (1: as measured)."; > = 1.0;
 uniform float DsUiGamma < ui_type = "drag"; ui_min = 0.2; ui_max = 3.0; ui_step = 0.01; ui_label = "DS UI gamma"; > = 1.0;
 uniform float DsUiStrength < ui_type = "drag"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.01; ui_label = "DS UI brightness"; > = 1.0;
 uniform float ShadowStrength < ui_type = "drag"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01; ui_label = "Her shadow";
 	ui_tooltip = "How dark her shadow on DS's ground is in full sun."; > = 0.5;
 uniform float ShadowReach < ui_type = "drag"; ui_min = 1.0; ui_max = 20.0; ui_step = 0.1; ui_label = "Shadow length limit (m)"; > = 10.0;
+uniform float ReprojectThickness < ui_type = "drag"; ui_min = 0.05; ui_max = 3.0; ui_step = 0.01; ui_label = "Her depth for re-projection (m)";
+	ui_tooltip = "When her picture is a frame older than the camera, a point this far behind her front still counts as her."; > = 0.35;
 uniform int DebugView < ui_type = "combo"; ui_items = "Composite\0Her depth (1 m bands)\0DS depth (1 m bands)\0"; > = 0;
 
 float src_linear(float d, float3 planes)
@@ -101,6 +124,15 @@ bool reproject(float2 uv, float zFar, sampler sd, float3 planes, float3 r0, floa
 	const float3 ray = float3((uv.x * 2.0 - 1.0) * tanv.x * BUFFER_WIDTH * BUFFER_RCP_HEIGHT, (1.0 - uv.y * 2.0) * tanv.x, -1.0);
 	const float2 scale = float2(tanv.y * tanv.z, tanv.y);
 	const float zNear = 0.2;
+	// her picture was drawn from this very camera: no marching, the pixel itself
+	if (AstraWarpIdentity)
+	{
+		const float2 n = ray.xy / scale;
+		suv = src_uv(n, planes);
+		zs = src_linear(tex2Dlod(sd, float4(suv, 0, 0)).r, planes);
+		return zs < 1e8 && zs < zFar + 0.05;
+	}
+	float zprev = zNear;
 	[loop] for (int i = 0; i < 24; ++i)
 	{
 		const float z = zNear * pow(zFar / zNear, i / 23.0);
@@ -113,10 +145,44 @@ bool reproject(float2 uv, float zFar, sampler sd, float3 planes, float3 r0, floa
 			continue;
 		const float zmv = src_linear(tex2Dlod(sd, float4(src_uv(n, planes), 0, 0)).r, planes);
 		if (zmv > -pm.z + 0.03)
+		{
+			zprev = z;
 			continue; // still in front of whatever the source drew there
+		}
+		// the step went from in front of her to behind: find where (halving), then is it her surface or a gap behind?
+		float lo = zprev, hi = z;
+		[loop] for (int b = 0; b < 7; ++b)
+		{
+			const float mid = 0.5 * (lo + hi);
+			const float3 pb = ray * mid;
+			const float3 mb = float3(dot(r0, pb), dot(r1, pb), dot(r2, pb)) + T;
+			const float2 nb = mb.xy / -mb.z / scale;
+			const float zb = mb.z < -1e-3 && all(abs(nb) <= 1.0) ? src_linear(tex2Dlod(sd, float4(src_uv(nb, planes), 0, 0)).r, planes) : 1e9;
+			if (zb > -mb.z + 0.03)
+				lo = mid;
+			else
+				hi = mid;
+		}
+		{
+			const float3 ph = ray * hi;
+			const float3 mh = float3(dot(r0, ph), dot(r1, ph), dot(r2, ph)) + T;
+			const float2 nh = mh.xy / -mh.z / scale;
+			const float zh2 = mh.z < -1e-3 && all(abs(nh) <= 1.0) ? src_linear(tex2Dlod(sd, float4(src_uv(nh, planes), 0, 0)).r, planes) : 1e9;
+			if (zh2 > 1e8 || -mh.z - zh2 > ReprojectThickness)
+			{
+				zprev = z;
+				continue; // the ray passes behind her (taking it would smear her along the motion)
+			}
+		}
+		const float z_hit = hi;
 		// crossed the source's surface: settle on it (fixed-point on the surface point's DS depth)
-		float zg = z;
+		float zg = z_hit;
 		float2 ndc = n;
+		{
+			const float3 ph = ray * z_hit;
+			const float3 mh = float3(dot(r0, ph), dot(r1, ph), dot(r2, ph)) + T;
+			ndc = mh.xy / -mh.z / scale;
+		}
 		[loop] for (int k = 0; k < 3; ++k)
 		{
 			const float3 pk = ray * zg;
@@ -157,6 +223,14 @@ float3 bands(float z)
 	return lerp(float3(0.1, 0.1, 0.1), float3(0.4, 0.85, 1.0), step(0.5, frac(z))) * saturate(1.5 - z / 100.0);
 }
 
+/// DS's fog between the camera and a point z metres away: how much of the point still shows (and the fog's colour).
+float fog_transmittance(float z, out float3 colour)
+{
+	const float4 f = tex2Dfetch(sFogParams, int2(0, 0));
+	colour = f.yzw;
+	return exp(-max(f.x, 0.0) * FogMatch * z);
+}
+
 /// Her own shading stays; DS's local light darkens and tints her a little, DS's grade colours her, far away DS's haze.
 float3 relight(float3 c, float2 uv, float z)
 {
@@ -169,7 +243,11 @@ float3 relight(float3 c, float2 uv, float z)
 	const float3 grade = clamp(lerp(1.0, M / max(luma(M), 1e-3), 0.6), 0.6, 1.6);
 	c = lerp(c, c * grade, GradeMatch);
 	const float h = saturate((1.0 - exp(-max(z - HazeStart, 0.0) / HazeDistance)) * HazeStrength);
-	return lerp(c, tex2Dlod(sAstraLight, float4(uv, 0, LightBlur + 1.0)).rgb, h);
+	c = lerp(c, tex2Dlod(sAstraLight, float4(uv, 0, LightBlur + 1.0)).rgb, h);
+	// DS's fog, as measured on its own picture
+	float3 fog;
+	const float t = fog_transmittance(z, fog);
+	return lerp(fog, c, t);
 }
 
 /// Her shadow without a view of her from the sun: her body as a capsule (her height, upright at her feet), and the
@@ -216,6 +294,62 @@ float her_shadow_map(float3 p)
 	return shadow / 9.0;
 }
 
+/// One cell: DS's colour and depth there; its dark channel (darkest channel over a small patch, against the fog colour
+/// of last frame) bounds the fog's transmittance from below, so -ln(1 - dark) / depth bounds its density from above.
+void PS_FogCells(float4 pos : SV_Position, float2 uv : TEXCOORD, out float outSigma : SV_Target0, out float4 outColour : SV_Target1)
+{
+	const float4 prev = tex2Dfetch(sFogPrev, int2(0, 0));
+	const float3 A = max(prev.yzw, 0.05);
+	float dark = 1.0;
+	float3 avg = 0.0;
+	[unroll] for (int y = -1; y <= 1; ++y)
+		[unroll] for (int x = -1; x <= 1; ++x)
+		{
+			const float3 c = tex2Dlod(ReShade::BackBuffer, float4(uv + float2(x, y) * float2(0.33 / FOG_W, 0.33 / FOG_H), 0, 0)).rgb;
+			dark = min(dark, min(c.r / A.r, min(c.g / A.g, c.b / A.b)));
+			avg += c;
+		}
+	avg /= 9.0;
+	const float d = host_linear(tex2Dlod(ReShade::DepthBuffer, float4(uv * DepthUvScale, 0, 0)).x);
+	// usable: not too near (noise), not the sky (no depth: it is the fog's colour itself)
+	const bool usable = d > 8.0 && d < 2000.0 && d < HostPlanes.y * 0.9;
+	outSigma = usable ? -log(max(1.0 - 0.95 * saturate(dark), 0.02)) / d : 1e4;
+	// the haziest places show the fog's colour: weight by how washed out they are (the sky counts fully)
+	const float w = usable ? pow(saturate(dark), 8.0) : (d >= HostPlanes.y * 0.9 ? 1.0 : 0.0);
+	outColour = float4(avg * w, w);
+}
+
+/// The frame's fog: density = the mean of the smallest bounds over blocks of cells (the clearest dark detail in each
+/// part of the picture), colour = the weighted mean of the haziest; eased from last frame's.
+float4 PS_FogParams(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+	float sum = 0.0, n = 0.0;
+	[loop] for (int by = 0; by < FOG_H / 6; ++by)
+		[loop] for (int bx = 0; bx < FOG_W / 8; ++bx)
+		{
+			float m = 1e4;
+			[loop] for (int y = 0; y < 6; ++y)
+				[loop] for (int x = 0; x < 8; ++x)
+					m = min(m, tex2Dfetch(sFogSigma, int2(bx * 8 + x, by * 6 + y)).r);
+			if (m < 1e3)
+			{
+				sum += m;
+				n += 1.0;
+			}
+		}
+	const float sigma = n > 0.0 ? sum / n : 0.0;
+	const float4 c = tex2Dlod(sFogColour, float4(0.5, 0.5, 0, 6));
+	const float4 prev = tex2Dfetch(sFogPrev, int2(0, 0));
+	const float3 colour = c.a > 1e-5 ? c.rgb / c.a : (prev.w > 0.0 ? prev.yzw : float3(0.6, 0.6, 0.6));
+	const float k = prev.w > 0.0 ? 0.08 : 1.0; // ease over ~a dozen frames
+	return float4(lerp(prev.x, sigma, k), lerp(prev.yzw, colour, k));
+}
+
+float4 PS_FogKeep(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+	return tex2Dfetch(sFogParams, int2(0, 0));
+}
+
 float4 PS_Light(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
 	return float4(tex2D(ReShade::BackBuffer, uv).rgb, 1.0);
@@ -226,7 +360,7 @@ float3 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	const float3 host = tex2D(ReShade::BackBuffer, uv).rgb;
 	if (!AstraActive)
 		return host;
-	const float zh = host_linear(tex2Dlod(ReShade::DepthBuffer, float4(uv, 0, 0)).x);
+	const float zh = host_linear(tex2Dlod(ReShade::DepthBuffer, float4(uv * DepthUvScale, 0, 0)).x);
 	if (DebugView == 2)
 		return bands(zh);
 	const float allow = min(DepthBias + SlopeBias * abs(ddy(zh)), max(MaxBias, DepthBias));
@@ -253,9 +387,15 @@ float3 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 	{
 		const float3 p = float3((uv.x * 2.0 - 1.0) * AstraWarpTan.x * BUFFER_WIDTH * BUFFER_RCP_HEIGHT, (1.0 - uv.y * 2.0) * AstraWarpTan.x, -1.0) * zh;
 		if (distance(p, AstraFeetView) < ShadowReach + 2.0)
-			shaded = host * (1.0 - ShadowStrength * AstraShadow * (SunVActive ? her_shadow_map(p) : her_shadow(p)));
+		{
+			float3 fogc;
+			const float tg = fog_transmittance(zh, fogc); // the fog over that ground fills her shadow in
+			shaded = host * (1.0 - ShadowStrength * AstraShadow * tg * (SunVActive ? her_shadow_map(p) : her_shadow(p)));
+		}
 	}
-	float3 c = (visible > 0.0 ? relight(astra.rgb, uv, za) : 0.0) + shaded * (1.0 - cover);
+	// (her colour is premultiplied: relight it as straight colour, then by her coverage again)
+	const float3 lit = visible > 0.0 && astra.a > 1e-4 ? relight(astra.rgb / astra.a, uv, za) * astra.a : 0.0;
+	float3 c = lit * visible + shaded * (1.0 - cover);
 	// DS's UI back over her (DS composited it with its scene before she was drawn over that)
 	if (DsUiActive && cover > 0.001)
 	{
@@ -268,6 +408,25 @@ float3 PS_Astra(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 
 technique AstraPassthrough < enabled = true; ui_tooltip = "Astra, drawn by her engine from DS's camera (on while her engine is linked)."; >
 {
+	pass FogCells
+	{
+		VertexShader = PostProcessVS;
+		PixelShader = PS_FogCells;
+		RenderTarget0 = FogSigmaTex;
+		RenderTarget1 = FogColourTex;
+	}
+	pass FogParams
+	{
+		VertexShader = PostProcessVS;
+		PixelShader = PS_FogParams;
+		RenderTarget = FogParamsTex;
+	}
+	pass FogKeep
+	{
+		VertexShader = PostProcessVS;
+		PixelShader = PS_FogKeep;
+		RenderTarget = FogPrevTex;
+	}
 	pass Light
 	{
 		VertexShader = PostProcessVS;

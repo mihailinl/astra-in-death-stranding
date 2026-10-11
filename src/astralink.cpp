@@ -238,6 +238,7 @@ namespace astralink
 			g_frame, cam[0], cam[1], cam[2], fwd[0], fwd[1], fwd[2], up[0], up[1], up[2], s.fov, std::max(s.near_plane, 0.05f), kFar, g_viewW,
 			g_viewH, yaw, pitch, roll);
 		layer::set_host_pose(yaw, pitch, roll, s.fov, cam[0], cam[1], cam[2]);
+		layer::expect_frame(g_frame);
 		// where she was for this camera: the compositor moves an older picture of her by how far she went since
 		{
 			std::lock_guard<std::mutex> lock(g_historyLock);

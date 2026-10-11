@@ -25,6 +25,12 @@ namespace layer
 	void set_sun(const float toward[3], float strength);
 	/// Her feet (engine coordinates) and her size: her shadow is cast from them.
 	void set_feet(const double feet[3], float size);
+	/// The camera id just sent to the engine: its picture is waited for (up to wait_ms) before compositing.
+	void expect_frame(unsigned long long cam_id);
+	/// How long to wait for that picture (ms; 0: never, re-project the newest instead). The overlay's slider.
+	float &wait_ms();
+	/// Times the picture wasn't there in time.
+	unsigned long long wait_timeouts();
 	/// Frames uploaded so far.
 	unsigned long long frames();
 }
