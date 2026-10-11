@@ -1,3 +1,6 @@
 [submodule "extern/minecraft-in-death-stranding"]
 	path = extern/minecraft-in-death-stranding
 	url = https://github.com/mihailinl/minecraft-in-death-stranding
+[submodule "extern/astra-reshade"]
+	path = extern/astra-reshade
+	url = https://github.com/mihailinl/astra-reshade

@@ -1,74 +1,100 @@
-# Astra in Death Stranding (private)
+# Astra in Death Stranding
 
-A ReShade add-on that puts Astra, the Astra companion's 3D avatar, next to Sam in **Death Stranding Director's
-Cut**. She walks with him on DS's real collision and rides in his truck, roadster or trike. The Astra avatar engine
-draws her from DS's camera, and the add-on composites her into DS's picture with depth: DS's rocks and Minecraft's
-blocks hide her, DS's UI stays on top.
+Astra, the Astra companion's 3D avatar, walks beside Sam in **Death Stranding
+Director's Cut** and **Death Stranding 2: On the Beach** (PC, Steam). She follows him on the game's real collision,
+strolls a little while he stands, and rides along in his truck, roadster or trike. Her own engine draws her from the
+game's camera; she is composited into the game's picture with its depth, so rocks and buildings hide her and the
+game's UI stays on top. She is lit by the game's sun and casts her shadow on its ground.
 
-It is a separate add-on from [minecraft-in-death-stranding](https://github.com/mihailinl/minecraft-in-death-stranding)
-(`dsmc.addon64`). It works alone, or next to the Minecraft add-on.
+It is a [ReShade](https://reshade.me) add-on in two parts:
 
-```
-Death Stranding (Proton)                                  Astra avatar engine (native, game bridge mode)
-  astra.addon64
-    astra.cpp      where she walks: a spot beside and behind Sam, on DS's collision; his vehicle's seat
-    astralink.cpp  ---- WebSocket 127.0.0.1:25600 ---->   cam (DS's camera) + avatar (pose, orientation, animator params)
-                   <-----------------------------------   hello (where its frames are), events
-    layer.cpp      <--- shared memory ("MCPT") --------   her picture + linear depth, and the camera it was drawn from
-                        /dev/shm/astra-frame (Wine: Z:\dev\shm\astra-frame), Windows: Local\AstraFrame
-  AstraPassthrough.fx  re-projects her picture onto DS's camera, depth-tests it against DS and Minecraft, DS's UI over
-```
+- **`astra.addon64`** — the [Astra foundation](https://github.com/mihailinl/astra-reshade), the same for every game:
+  the link to her engine, her pictures, the depth test, the re-projection onto the game's camera;
+- **`astra-ds.addon64`** — this repository: what only Death Stranding can say — where its camera is, where Sam is, its
+  sun, and where she walks.
 
-Shared with the Minecraft mod through the submodule `extern/minecraft-in-death-stranding`, not copied:
-- `game` reads DS's camera and Sam;
-- `physics` makes DS's collision queries;
-- `guard` contains faults;
-- `ws` is the WebSocket client;
-- `ui` finds DS's UI target and lays it over what the add-ons draw (one add-on per process does it).
+Supported builds: Death Stranding Director's Cut, Steam build 13300582; Death Stranding 2, Steam build 23923251. On
+any other build the add-on finds the game's code does not match and stays idle (the overlay says so) — the game is
+never touched.
+
+## Install
+
+**With Astra (recommended):** Astra's **Games** tab installs it and starts the game with her. Astra's engine must be
+running (it is, when the companion is on).
+
+**By hand**, from a release's `astra-gi.zip` (the `ds1-v…` release for Director's Cut, `ds2-v…` for Death
+Stranding 2), into the game's folder (where `ds.exe` / `DS2.exe` is):
+
+- `dxgi.dll` (ReShade 6.8.0 with full add-on support) and `ReShade.ini`;
+- `astra.addon64` and `astra-ds.addon64`;
+- `reshade-shaders/Shaders/AstraPassthrough.fx`, `AstraGame.fxh` and `ReShade.fxh`.
+
+If ReShade with add-on support is already there (for example from Minecraft in Death Stranding), keep your
+`dxgi.dll` and `ReShade.ini` and add the rest. Her engine's port is 25600 by default; Astra passes its own port and
+token on the game's command line (`-AstraConfig=<file>`).
+
+**Linux (Proton):** ReShade loads as `dxgi.dll` only with the launch option
+`WINEDLLOVERRIDES="dxgi=n,b" %command%` (Astra's Games tab sets this override in the game's Proton prefix for you).
+
+Remove: delete those files again (and `dxgi.dll` + `ReShade.ini` if nothing else uses ReShade).
+
+## In the game
+
+ReShade's overlay (Home key) has two tabs:
+
+- **Astra** (the foundation): the link to her engine, her pictures, "Show Astra", her size, "wait for her picture".
+- **Astra in Death Stranding**: "Astra follows Sam", **Call Astra** (she comes to Sam now), her size, the passenger
+  seat's height and offset, the sun she is lit by, and DS's UI switch.
+
+The log is `astra-reshade.log`, beside Astra's settings for the game (or beside the game's exe).
 
 ## How she moves
 
 - **Walking:**
-  - Rays down use the layer of Sam's own feet (96). They find terrain, building floors, structures, chiral bridges and
-    Minecraft blocks' boxes.
-  - Spheres test walls and ceilings on what stops Sam (34).
+  - Rays down use the layer of Sam's own feet. They find terrain, building floors, structures, chiral bridges and
+    Minecraft blocks' boxes (with Minecraft in Death Stranding).
+  - Spheres test walls and ceilings on what stops Sam.
   - She steps up to 0.6 m, goes round slopes over ~49° and falls with gravity.
   - She comes back to Sam when she is 28 m behind, a floor apart for 2.5 s, stuck, or falling.
-- **Riding:**
-  - Sam is found sitting in a vehicle by rays through him: truck `DSVehicleTruck`, trike `DSVehicleMotorbike`,
-    roadster `DSVehicleSpeedCar`, by their vtables.
-  - She takes the passenger seat: Sam's seat mirrored across the vehicle, or behind him on the trike. She gets the
-    vehicle's orientation.
-  - The engine plays its `seat` state, and her hips are pinned to the seat (`anchor: hips`) after its sit-down clip.
-    `unseat` stands her up.
-  - The seat point can be tuned in the overlay.
-- **Latency:** an older picture of her is moved by how far she went since it was drawn, so running and driving don't
-  drag her.
+  - In Death Stranding 2 her walking runs on the game's own update thread (the only one its physics answers on).
+- **Riding:** Sam is found sitting in a vehicle by rays through him (truck, trike, roadster). She takes the passenger
+  seat — Sam's seat mirrored across the vehicle, or behind him on the trike — and the vehicle's orientation. Her
+  engine plays its `seat` state and pins her hips to the seat after its sit-down clip; `unseat` stands her up.
+- **What her engine is told** is raw facts — her speed, whether she is in the air, her vertical speed, whether she
+  is seated — never "walk" or "run": what they mean is her animation set's business, which the owner can change.
 
-## Build and install
+## With Minecraft in Death Stranding
 
-```bash
-git clone --recursive <this repo> && cd astra-in-death-stranding
-extern/minecraft-in-death-stranding/tools/fetch_deps.sh   # ReShade headers, imgui (into the submodule's third_party/)
-./build.sh                                                # -> build/astra.addon64 (clang-cl + xwin, like the Minecraft mod)
-./install.sh                                              # astra.addon64 + AstraPassthrough.fx into DS's folder
-```
+Both mods share one ReShade. Minecraft's blocks hide her where they are in front of her, and DS's UI is laid back over
+both (whichever add-on loads first does that for every effect).
 
-ReShade must already be in DS's folder. The Minecraft mod's `install.sh` puts it there; on Linux that also needs the
-launch option `WINEDLLOVERRIDES="dxgi=n,b" %command%`. `./install.sh --remove` takes Astra out again. Her technique
-enables itself (`enabled = true`), so no preset changes are needed.
-
-## Running
-
-1. Start the engine in bridge mode (`WGPU_PROTO_WINDOW=bridge`, see the engine's game-bridge notes). Without it,
-   `uv run --with numpy --with websockets tools/fake_astra.py` stands in: a capsule in her place.
-2. Start DS. ReShade's overlay has an **Astra** tab: the engine link, "Astra follows Sam", "Call Astra", the seat
-   sliders, and DS's UI switch and frame trace (when this add-on is the one doing it).
-
-The add-on logs to `astra.log` in DS's folder.
-
-## Updating the shared code
+## Build from source (Linux)
 
 ```bash
-git -C extern/minecraft-in-death-stranding pull origin main && git add extern/minecraft-in-death-stranding
+git clone --recursive https://github.com/mihailinl/astra-in-death-stranding && cd astra-in-death-stranding
+extern/minecraft-in-death-stranding/tools/fetch_deps.sh                         # ReShade's headers, imgui, ReShade 6.8.0
+extern/astra-reshade/extern/minecraft-in-death-stranding/tools/fetch_deps.sh    # the same for the foundation's pin
+./build.sh            # clang-cl + lld-link + xwin's MSVC CRT/SDK -> build/astra-ds.addon64, extern/astra-reshade/build/astra.addon64
+tools/package-gi.sh   # -> build/gi/ds1/astra-gi.zip, build/gi/ds2/astra-gi.zip (the release assets)
+./install.sh [--ds2]  # a developer's install into the game's folder (ReShade must be there already); --remove
 ```
+
+`xwin splat --output ~/.xwin` provides the MSVC CRT and Windows SDK (`XWIN` points elsewhere). `MC_DIR` and
+`ASTRA_RESHADE_DIR` build against local checkouts of the two submodules instead.
+
+| path | what |
+|---|---|
+| `src/main.cpp` | the add-on: once per presented frame (the foundation's present callback) DS's camera, her placement and the sun go to the foundation |
+| `src/astra.cpp` | where she walks and rides |
+| `src/sun.cpp` | DS's sun (or moon), found in the game's memory |
+| `src/foundation.cpp` | the foundation's provider API (`extern/astra-reshade/include/astra_provider.h`), looked up in `astra.addon64` |
+| `shaders/AstraGame.fxh` | DS's hooks into the foundation's effect: DS's UI over her, Minecraft's blocks in front of her |
+| `gi/` | the release manifests (`ds1/`, `ds2/`) and their `ReShade.ini` |
+| `extern/minecraft-in-death-stranding` | DS's camera, Sam, collision and UI, shared with the Minecraft mod |
+| `extern/astra-reshade` | the foundation |
+
+## Licence
+
+MIT (`LICENSE`), with the lineage it names. ReShade is BSD-3-Clause; everything else a release ships or compiles in is
+listed in `THIRD_PARTY.md`. Death Stranding is KOJIMA PRODUCTIONS' game; this is an unofficial fan mod, not affiliated
+with or endorsed by them.

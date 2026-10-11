@@ -1,12 +1,15 @@
 #!/bin/bash
-# Put the Astra add-on into Death Stranding's folder (next to ReShade, which this doesn't install: the Minecraft mod's
-# install.sh does, or ReShade's own installer with full add-on support).
-#   ./install.sh            astra.addon64 + AstraPassthrough.fx (its technique enables itself: no preset changes)
+# A developer's install into Death Stranding's folder, from ./build.sh's output (players install through Astra's
+# Games tab, or by hand from the release zip: README.md). ReShade must already be there (ReShade's own installer with
+# full add-on support, or the Minecraft mod's install.sh): this adds Astra's files beside it.
+#   ./install.sh            the foundation (astra.addon64 + AstraPassthrough.fx), DS's part (astra-ds.addon64 +
+#                           AstraGame.fxh); the technique enables itself: no preset changes
 #   ./install.sh --remove   takes them out again
 #   ./install.sh --ds2 ...  the same for Death Stranding 2
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 MC=${MC_DIR:-$HERE/extern/minecraft-in-death-stranding}
+AR=${ASTRA_RESHADE_DIR:-$HERE/extern/astra-reshade}
 GAME_ID=1; REMOVE=0
 for a in "$@"; do
 	case "$a" in
@@ -40,8 +43,10 @@ put() { # put <source> <path relative to the game folder>
 	mkdir -p "$(dirname "$GAME/$2")"
 	cp -f "$1" "$GAME/$2.new" && mv -f "$GAME/$2.new" "$GAME/$2"
 }
-put "$HERE/build/astra.addon64" astra.addon64
-put "$HERE/shaders/AstraPassthrough.fx" reshade-shaders/Shaders/AstraPassthrough.fx
+put "$AR/build/astra.addon64" astra.addon64
+put "$HERE/build/astra-ds.addon64" astra-ds.addon64
+put "$AR/shaders/AstraPassthrough.fx" reshade-shaders/Shaders/AstraPassthrough.fx
+put "$HERE/shaders/AstraGame.fxh" reshade-shaders/Shaders/AstraGame.fxh
 
 sort -u "$MANIFEST.new" > "$MANIFEST"; rm -f "$MANIFEST.new"
 echo "installed into $GAME:"; sed 's/^/  /' "$MANIFEST"

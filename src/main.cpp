@@ -1,31 +1,41 @@
-// Astra in Death Stranding: a ReShade add-on of its own (next to the Minecraft one, or alone).
-//   astra.cpp      where she walks: follows Sam on DS's real collision, rides in his vehicles
-//   astralink.cpp  the Astra avatar engine's game bridge: DS's camera and her pose out, her pictures back
-//   layer.cpp      her pictures into AstraPassthrough.fx, against DS's depth (and Minecraft's)
+// Astra in Death Stranding: the game's part of Astra, the Astra companion's avatar, in Death Stranding Director's Cut
+// and Death Stranding 2 - a PROVIDER add-on (astra-ds.addon64) for the Astra foundation (astra-reshade's
+// astra.addon64, extern/astra-reshade), which ReShade loads beside it and which composites her into DS's picture.
+// This add-on decides what only DS can: where she is and what DS's camera and sun are.
+//   astra.cpp       where she walks: follows Sam on DS's real collision, rides in his vehicles
+//   sun.cpp         DS's sun (or moon), found in its memory
+//   foundation.cpp  the foundation's provider API, looked up in its module
+//   main.cpp        once per presented frame, from the foundation's present callback: DS's camera, her placement,
+//                   her animator parameters and the sun, handed to the foundation
 // Shared with the Minecraft mod (extern/minecraft-in-death-stranding): DS's camera and Sam (game), DS's collision
-// (physics), fault containment (guard), the WebSocket client (ws) and DS's UI over what add-ons draw (ui).
+// (physics), fault containment (guard) and DS's UI over what add-ons draw (ui).
 #define ImTextureID ImU64
 #include <imgui.h>
 #include <reshade.hpp>
 #include "astra.h"
-#include "astralink.h"
+#include "foundation.h"
 #include "game.h"
 #include "guard.h"
-#include "layer.h"
 #include "log.h"
 #include "physics.h"
 #include "sun.h"
 #include "ui.h"
 #include <windows.h>
-#include <cstdarg>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdarg>
 #include <cstdio>
+#include <mutex>
+#include <string>
+#include <vector>
 
 using namespace reshade::api;
 
-extern "C" __declspec(dllexport) const char *NAME = "Astra";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "Astra, the Astra companion's avatar, walks with Sam in Death Stranding.";
+extern "C" __declspec(dllexport) const char *NAME = "Astra in Death Stranding";
+extern "C" __declspec(dllexport) const char *DESCRIPTION =
+	"Astra, the Astra companion's avatar, walks with Sam in Death Stranding (Director's Cut) and Death Stranding 2 (needs astra.addon64, the "
+	"Astra foundation).";
 
 namespace
 {
@@ -33,12 +43,15 @@ namespace
 	char g_status[256] = "not resolved";
 	char g_physStatus[160] = "physics: not resolved";
 	game::Snapshot g_snap;
-	uint64_t g_frame = 0;
-	FILE *g_log = nullptr;
 	ULONGLONG g_readPausedUntil = 0;
 	bool g_followBroken = false;
 	sun::State g_sun{};
 	float g_lit = 1.0f;
+	std::atomic<bool> g_linked{false}; // the foundation was found and calls per_frame at every Present
+
+	// the log: the foundation's (astra-reshade.log, beside Astra's settings for DS); lines from before it was found wait
+	std::mutex g_logLock;
+	std::vector<std::string> g_early;
 
 	/// The camera read retries after a fault (pointers are briefly stale while the game loads)
 	void read_snapshot()
@@ -54,14 +67,6 @@ namespace
 			g_readPausedUntil = GetTickCount64() + 2000;
 		}
 	}
-
-	// When DS's camera is read and her camera goes to the engine: at the start of the Present, before ReShade renders
-	// its effects (so her picture is re-projected onto the camera being presented, and the engine gets it soonest), or,
-	// as before, after them (reshade_present: her picture then lands on the previous frame's camera). Overlay switch.
-	bool g_earlyCamera = true;
-	uint32_t g_bbWidth = 0, g_bbHeight = 0;
-
-	void per_frame(uint32_t w, uint32_t h);
 
 	// Death Stranding 2: once per game frame on its update thread (physics::install_tick): her walking and how much of
 	// her is in the sun, from a snapshot of its own
@@ -93,33 +98,92 @@ namespace
 		}
 	}
 
-	void on_present(effect_runtime *runtime)
+	// ---- DS -> the foundation (glTF: right-handed, Y up, metres; DS: Z up) ----------------------------------------
+
+	void to_gl(const double ds[3], double out[3])
 	{
-		++g_frame;
-		runtime->get_screenshot_width_and_height(&g_bbWidth, &g_bbHeight);
-		if (!g_earlyCamera)
-			per_frame(g_bbWidth, g_bbHeight);
+		out[0] = ds[0];
+		out[1] = ds[2];
+		out[2] = -ds[1];
 	}
 
-	void on_present_early(command_queue *, swapchain *, const rect *, const rect *, uint32_t, const rect *)
+	void dir_to_gl(const float ds[3], float out[3])
 	{
-		if (g_earlyCamera)
-			per_frame(g_bbWidth, g_bbHeight);
+		out[0] = ds[0];
+		out[1] = ds[2];
+		out[2] = -ds[1];
 	}
 
-	void per_frame(uint32_t w, uint32_t h)
+	constexpr float kNoonSun = 2.1e6f;              // DS's daylight sun: intensity 2.0e6 x colour 1.05 (measured, afternoon, clear)
+	constexpr float kAirborneAfter = 0.18f;         // seconds falling before she's "in the air" for the animations
+	constexpr unsigned long long kSitDownMs = 1300; // the engine's seat_in clip
+	unsigned long long g_frame = 0;
+	ULONGLONG g_paramTick = 0;
+	double g_prevPos[3] = {};
+	float g_speed = 0.0f, g_airTime = 0.0f, g_scale = 0.0f;
+	bool g_seated = false, g_hips = false;
+	unsigned long long g_seatedAt = 0;
+
+	/// Her placement and her animator parameters: raw facts, but steady - what they mean (walk, run, a chair) is her
+	/// animation set's call.
+	void send_placement(const foundation::Api &f, const astra::State &a)
 	{
-		if (!g_resolved)
-			return;
-		static bool started = false;
-		if (!started)
+		double feet[3];
+		to_gl(a.pos, feet);
+		float face[3], her_up[3], vel[3];
+		dir_to_gl(a.fwd, face);
+		dir_to_gl(a.up, her_up);
+		dir_to_gl(a.vel, vel);
+		// her pace over the ground smoothed (per-frame displacement is noisy, and a jump back to Sam isn't a sprint), and
+		// "in the air" only after a moment off the ground (a one-frame drop on rough ground would be a hop and a landing)
+		const ULONGLONG now = GetTickCount64();
+		const float dt = g_paramTick ? std::min(float(now - g_paramTick) * 0.001f, 0.1f) : 0.0f;
+		g_paramTick = now;
+		const double jump = std::hypot(a.pos[0] - g_prevPos[0], a.pos[1] - g_prevPos[1]);
+		std::copy(a.pos, a.pos + 3, g_prevPos);
+		const float raw_speed = std::sqrt(a.vel[0] * a.vel[0] + a.vel[1] * a.vel[1]);
+		if (jump > 2.0 || a.seated)
+			g_speed = 0.0f;
+		else
+			g_speed += (std::min(raw_speed, 12.0f) - g_speed) * std::min(1.0f, dt * 10.0f);
+		const float ground_speed = g_speed < 0.05f ? 0.0f : g_speed;
+		g_airTime = a.gait == astra::Gait::fall ? g_airTime + dt : 0.0f;
+		const bool airborne = g_airTime > kAirborneAfter;
+		// her size eases to the slider's (the engine applies it at once)
+		g_scale = g_scale <= 0.0f ? astra::scale() : g_scale + (astra::scale() - g_scale) * std::min(1.0f, dt * 4.0f);
+
+		// riding with Sam: she sits down on a chair-like seat ("seat": the engine's sitting-on-a-chair state) and stands up
+		// again ("unseat": its stand-up clip, then the graph's own states) when he gets out
+		if (a.seated != g_seated)
 		{
-			started = true; // threads start here, not in DllMain (loader lock)
-			astralink::start();
+			g_seated = a.seated;
+			g_seatedAt = now;
+			if (a.seated)
+				f.cue("play", "seat");
+			else
+				f.cue("trigger", "unseat");
 		}
+		// sitting down: her feet stay where they are while the sit-down clip plays, then her hips go onto the seat (the
+		// engine eases between the two); seated, her pos is the seat
+		const bool hips = a.seated && now - g_seatedAt > kSitDownMs;
+		if (hips != g_hips)
+		{
+			g_hips = hips;
+			f.anchor(hips ? "hips" : "feet");
+		}
+		f.param("vspeed", a.vel[2]);
+		f.param("seated", a.seated ? 1.0f : 0.0f);
+		f.avatar(feet, face, her_up, vel, a.seated ? 0.0f : ground_speed, airborne, g_scale);
+	}
+
+	/// Once per Present, called by the foundation before it reads anything: DS's camera read now IS the frame being
+	/// presented. Present thread.
+	void per_frame(void *)
+	{
+		const foundation::Api *f = foundation::api();
+		if (f == nullptr)
+			return;
 		read_snapshot();
-		if (g_snap.ok && g_snap.near_plane > 0.0f && g_snap.far_plane > g_snap.near_plane)
-			layer::set_host_planes(g_snap.near_plane, g_snap.far_plane);
 		// her walking calls into the game: a fault switches it off instead of letting DS's crash handler end the game.
 		// Death Stranding 2 answers physics queries only on its own update thread: there it runs in game_tick()
 		const bool ds2 = game::version() == 2;
@@ -135,20 +199,37 @@ namespace
 		else if (!g_followBroken && !guard::run("Astra follows Sam", [] { astra::frame(g_snap); }))
 			g_followBroken = true;
 
-		// DS's sun (or moon): her light in the engine, and her shadow on DS's ground
+		// DS's sun (or moon): her light in the engine, and her shadow on DS's ground (how much of her is in it)
 		g_sun = sun::read();
 		g_tickSun = g_sun;
 		float lit = ds2 ? g_tickLit.load() : 1.0f;
 		if (!ds2 && g_sun.valid && g_snap.ok && !g_followBroken)
 			guard::run("Astra in the sun", [&] { lit = astra::sunlit(g_sun.toward, reinterpret_cast<const void *>(g_snap.sam_ptr)); });
 		g_lit += (lit - g_lit) * 0.15f;
-		astralink::set_light(g_sun.valid, g_sun.toward, g_sun.color, g_sun.intensity, g_lit);
-		// the frame's cam goes last: the engine renders the moment it reads it (anything after lands on the next frame)
-		astralink::frame(g_snap, int(w), int(h));
-		const float toward_gl[3] = {g_sun.toward[0], g_sun.toward[2], -g_sun.toward[1]};
-		// her shadow: while the light is up (it fades as it sets) and she stands in it
-		const float up = g_sun.valid ? std::clamp(g_sun.toward[2] * 5.0f, 0.0f, 1.0f) : 0.0f;
-		layer::set_sun(toward_gl, up * g_lit);
+
+		const astra::State a = astra::state();
+		const bool live = g_snap.ok && a.valid && astra::enabled();
+		f->visible(live);
+		if (!live)
+			return;
+		send_placement(*f, a);
+		if (g_sun.valid)
+		{
+			float toward[3];
+			dir_to_gl(g_sun.toward, toward);
+			f->light(toward, g_sun.color, g_sun.intensity / kNoonSun, g_lit); // intensity relative to DS's clear noon
+		}
+		// DS's camera last (a habit of the protocol: the engine draws when a camera comes): Col1 looks, Col2 is up;
+		// FieldOfView is vertical; its far plane only when it is one
+		double eye[3];
+		float fwd[3], up[3];
+		to_gl(g_snap.cam.pos, eye);
+		dir_to_gl(g_snap.cam.col[1], fwd);
+		dir_to_gl(g_snap.cam.col[2], up);
+		const float near_m = g_snap.near_plane > 0.0f ? g_snap.near_plane : 0.0f;
+		const float far_m = near_m > 0.0f && g_snap.far_plane > near_m ? g_snap.far_plane : 0.0f;
+		f->camera2(++g_frame, eye, fwd, up, g_snap.fov, 0, 0.0f, near_m, far_m);
+
 		static ULONGLONG next_sun_log = 0;
 		if (g_sun.valid && GetTickCount64() >= next_sun_log)
 		{
@@ -160,24 +241,50 @@ namespace
 		}
 	}
 
+	/// This add-on's own Present: only to find the foundation (ReShade may load it after this one) and say who
+	/// provides; from then on the foundation calls per_frame at the start of every Present.
+	void on_present(command_queue *, swapchain *, const rect *, const rect *, uint32_t, const rect *)
+	{
+		if (g_linked || !g_resolved || !foundation::find())
+			return;
+		const foundation::Api *f = foundation::api();
+		{
+			std::lock_guard<std::mutex> lock(g_logLock);
+			for (const std::string &line : g_early)
+				f->log(line.c_str());
+			g_early.clear();
+			g_linked = true;
+		}
+		if (game::version() == 2)
+			f->identity("astra.death-stranding-2", "Death Stranding 2: On the Beach");
+		else
+			f->identity("astra.death-stranding", "Death Stranding Director's Cut");
+		f->on_present(per_frame, nullptr);
+		logf("linked: %s", foundation::status());
+	}
+
+	/// Minecraft in Death Stranding (MCPassthrough.fx, when installed) leaves its coverage and depth in McInfoTex -
+	/// the foundation's occluder texture in DS (shaders/AstraGame.fxh): she hides behind its blocks while it composited.
+	void on_begin_effects(effect_runtime *runtime, command_list *, resource_view, resource_view)
+	{
+		bool mc = false;
+		if (const effect_uniform_variable v = runtime->find_uniform_variable("MCPassthrough.fx", "McActive"); v.handle != 0)
+			runtime->get_uniform_value_bool(v, &mc, 1);
+		if (const effect_uniform_variable v = runtime->find_uniform_variable("AstraPassthrough.fx", "AstraOccluderActive"); v.handle != 0)
+			runtime->set_uniform_value_bool(v, mc);
+	}
+
 	void on_overlay(effect_runtime *)
 	{
 		ImGui::TextUnformatted(g_status);
 		ImGui::SameLine();
 		ImGui::TextDisabled("%s", g_physStatus);
+		if (g_linked)
+			ImGui::TextDisabled("%s (its own Astra tab: her engine, her picture)", foundation::status());
+		else
+			ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "%s", foundation::status());
 		if (g_followBroken)
-			ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Her walking hit a fault and was switched off (see astra.log GUARD)");
-		const astralink::Stats ls = astralink::stats();
-		ImGui::Text("Astra engine: %s   sent %llu  received %llu  frames %llu", astralink::connected() ? "linked" : "waiting (127.0.0.1:25600)", ls.sent,
-			ls.received, ls.frames);
-		if (const char *ev = astralink::last_event(); ev[0])
-			ImGui::TextDisabled("last: %s", ev);
-		ImGui::Checkbox("Camera of this frame (off: the previous one)", &g_earlyCamera);
-		ImGui::SameLine();
-		ImGui::SetNextItemWidth(140);
-		ImGui::SliderFloat("wait for her picture", &layer::wait_ms(), 0.0f, 12.0f, "%.1f ms");
-		ImGui::SameLine();
-		ImGui::TextDisabled("(late %llu times)", layer::wait_timeouts());
+			ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "Her walking hit a fault and was switched off (see astra-reshade.log GUARD)");
 		bool on = astra::enabled();
 		if (ImGui::Checkbox("Astra follows Sam", &on))
 			astra::set_enabled(on);
@@ -220,19 +327,24 @@ namespace
 	}
 }
 
+/// The shared code's log (log.h): into the foundation's log once it is found; the first lines wait until then.
 void logf(const char *fmt, ...)
 {
-	if (g_log == nullptr)
-		return;
-	SYSTEMTIME t;
-	GetLocalTime(&t);
-	std::fprintf(g_log, "%02d:%02d:%02d.%03d f%llu ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, (unsigned long long)g_frame);
+	char line[512];
 	va_list args;
 	va_start(args, fmt);
-	std::vfprintf(g_log, fmt, args);
+	std::vsnprintf(line, sizeof(line), fmt, args);
 	va_end(args);
-	std::fputc('\n', g_log);
-	std::fflush(g_log);
+	{
+		std::lock_guard<std::mutex> lock(g_logLock);
+		if (!g_linked)
+		{
+			if (g_early.size() < 100)
+				g_early.emplace_back(line);
+			return;
+		}
+	}
+	foundation::api()->log(line);
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
@@ -242,33 +354,25 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 	case DLL_PROCESS_ATTACH:
 		if (!reshade::register_addon(module))
 			return FALSE;
-		{
-			wchar_t path[MAX_PATH];
-			GetModuleFileNameW(nullptr, path, MAX_PATH);
-			if (wchar_t *slash = wcsrchr(path, L'\\'))
-				wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"astra.log");
-			_wfopen_s(&g_log, path, L"a");
-		}
-		logf("---- Astra loaded");
+		logf("---- Astra in Death Stranding loaded");
 		guard::install();
 		g_resolved = game::resolve(g_status, sizeof(g_status));
 		logf("resolve: %s", g_status);
 		physics::resolve(g_physStatus, sizeof(g_physStatus));
 		logf("%s", g_physStatus);
 		ui::install(); // DS's UI over her (unless another of our add-ons already does it for every effect)
-		layer::install();
-		reshade::register_event<reshade::addon_event::present>(on_present_early);
-		reshade::register_event<reshade::addon_event::reshade_present>(on_present);
-		reshade::register_overlay("Astra", on_overlay);
+		reshade::register_event<reshade::addon_event::present>(on_present);
+		reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
+		reshade::register_overlay("Astra in Death Stranding", on_overlay);
 		break;
 	case DLL_PROCESS_DETACH:
 		physics::uninstall_tick();
-		if (reserved == nullptr) // FreeLibrary; on process exit the link thread is already gone, joining would hang
-			astralink::stop();
+		// FreeLibrary: the foundation must not call into this module again (at process exit nothing presents any more,
+		// and the foundation may be gone already)
+		if (reserved == nullptr && g_linked && GetModuleHandleW(L"astra.addon64") != nullptr)
+			foundation::api()->on_present(nullptr, nullptr);
 		ui::uninstall();
 		reshade::unregister_addon(module);
-		if (g_log)
-			std::fclose(g_log);
 		break;
 	}
 	return TRUE;

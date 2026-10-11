@@ -1,0 +1,82 @@
+# astra-gi.toml (schema 1, astra-bepinex/docs/GAME-INTEGRATION-MANIFEST.md): Astra in Death Stranding Director's Cut.
+# The release tagged ds1-v<version> carries it as astra-gi.zip (Death Stranding 2's is gi/ds2/, tagged ds2-v<version>:
+# one repository, one release per game - a manifest names one game).
+# ReShade (BSD-3-Clause) runs two add-ons, both ours (MIT), in DS's standard ReShade layout - the same one the
+# Minecraft in Death Stranding mod uses, so the two share one ReShade:
+#   astra.addon64     the Astra foundation (astra-reshade): her engine's pictures composited with DS's depth
+#   astra-ds.addon64  Death Stranding's part: DS's camera, Sam, the sun, where she walks
+# tools/package-gi.sh builds the zip from this file: it fills in the digests of OUR files (they change with every
+# build); the upstream digests below are fixed by the pinned releases.
+schema = 1
+
+[integration]
+id = "astra.death-stranding"
+name = "Astra in Death Stranding Director's Cut"
+version = "0.1.0"
+authors = ["mihailinl"]
+license = "MIT AND BSD-3-Clause AND CC0-1.0" # ours: MIT; ReShade: BSD-3-Clause; ReShade.fxh: CC0-1.0
+repo = "https://github.com/mihailinl/astra-in-death-stranding"
+
+[target]
+steam_appid = 1850570                        # DEATH STRANDING DIRECTOR'S CUT (Steam build 13300582)
+exe = "ds.exe"
+platforms = ["windows-x64", "linux-proton"]
+anti_cheat = "none"
+
+# the licences of everything in here, into Astra's own folder for this game
+[[files]]
+from = "LICENSES/**"
+to = "${profile}/LICENSES/"
+
+# ---- the game folder (beside ds.exe) ----
+
+# ReShade 6.8.0 with full add-on support: ReShade64.dll from ReShade_Setup_6.8.0_Addon.exe, renamed (upstream,
+# unmodified). Already there with this digest (another mod installed the same ReShade): reused, never removed.
+[[game_files]]
+from = "dxgi.dll"
+to = "${game}/dxgi.dll"
+sha256 = "0cee63f9c9f13f3ac909c5b4903f4dbb4b719a7ab3b4f13b0deaf83c814b94f7"
+
+# ReShade's settings: add-ons and shaders in DS's folder, depth copied before DS clears it. ReShade rewrites this
+# file while it runs (its overlay's state, Astra's [ASTRA] sliders), so it carries no digest.
+[[game_files]]
+from = "ReShade.ini"
+to = "${game}/ReShade.ini"
+
+[[game_files]]
+from = "astra.addon64"
+to = "${game}/astra.addon64"
+sha256 = "@sha256:astra.addon64@"
+
+[[game_files]]
+from = "astra-ds.addon64"
+to = "${game}/astra-ds.addon64"
+sha256 = "@sha256:astra-ds.addon64@"
+
+[[game_files]]
+from = "reshade-shaders/Shaders/AstraPassthrough.fx"
+to = "${game}/reshade-shaders/Shaders/AstraPassthrough.fx"
+sha256 = "@sha256:reshade-shaders/Shaders/AstraPassthrough.fx@"
+
+# DS's hooks into the foundation's effect (DS's UI over her; the Minecraft mod's blocks in front of her)
+[[game_files]]
+from = "reshade-shaders/Shaders/AstraGame.fxh"
+to = "${game}/reshade-shaders/Shaders/AstraGame.fxh"
+sha256 = "@sha256:reshade-shaders/Shaders/AstraGame.fxh@"
+
+# ReShade's shader header (crosire/reshade-shaders, branch slim at fd00221, CC0-1.0; upstream, unmodified)
+[[game_files]]
+from = "reshade-shaders/Shaders/ReShade.fxh"
+to = "${game}/reshade-shaders/Shaders/ReShade.fxh"
+sha256 = "6dabfbbaf968c3871905d2ea17f96572ff7b1cec01310b5d0e5252b66b30174f"
+
+[launch]
+# -AstraConfig: where the foundation reads her engine's port and this session's token (DS ignores the argument; a
+# Steam launch carries arguments, not environment)
+args = ["-AstraConfig=${profile}/astra-reshade.ini"]
+proton_dll_overrides = { dxgi = "native,builtin" }
+
+[[config_writes]]
+file = "${profile}/astra-reshade.ini"
+section = "bridge"
+set = { Port = "${bridge_port}", Token = "${bridge_token}" }
