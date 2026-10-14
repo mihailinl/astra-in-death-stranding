@@ -372,6 +372,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 		if (reserved == nullptr && g_linked && GetModuleHandleW(L"astra.addon64") != nullptr)
 			foundation::api()->on_present(nullptr, nullptr);
 		ui::uninstall();
+		guard::uninstall(); // never leave a vectored handler pointing into this module once it is unmapped (astra-reshade 8dc0961)
 		reshade::unregister_addon(module);
 		break;
 	}
