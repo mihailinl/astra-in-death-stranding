@@ -241,6 +241,17 @@ namespace
 		}
 	}
 
+	/// A device was destroyed. ReShade loads and unloads its add-ons with every D3D device - DS2 does this once at
+	/// every start-up (a probe device, dropped, then the real one), DS1 on an alt-tab or a resolution change - so
+	/// the compositor (astra.addon64) may be a DIFFERENT instance by the time the next frame presents, or gone for
+	/// a moment. Dropping the link here (not re-resolving it: foundation::find() does that, on the present thread,
+	/// against whatever module is actually loaded then) re-arms on_present's one-time registration instead of
+	/// leaving it believing a stale instance is still good.
+	void on_destroy_device(device *)
+	{
+		g_linked = false;
+	}
+
 	/// This add-on's own Present: only to find the foundation (ReShade may load it after this one) and say who
 	/// provides; from then on the foundation calls per_frame at the start of every Present.
 	void on_present(command_queue *, swapchain *, const rect *, const rect *, uint32_t, const rect *)
@@ -362,6 +373,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 		logf("%s", g_physStatus);
 		ui::install(); // DS's UI over her (unless another of our add-ons already does it for every effect)
 		reshade::register_event<reshade::addon_event::present>(on_present);
+		reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
 		reshade::register_event<reshade::addon_event::reshade_begin_effects>(on_begin_effects);
 		reshade::register_overlay("Astra in Death Stranding", on_overlay);
 		break;

@@ -16,7 +16,7 @@ schema = 1
 [integration]
 id = "astra.death-stranding"
 name = "Astra in Death Stranding Director's Cut"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["mihailinl"]
 license = "MIT AND BSD-3-Clause AND CC0-1.0" # ours: MIT; ReShade: BSD-3-Clause; ReShade.fxh: CC0-1.0
 repo = "https://github.com/mihailinl/astra-in-death-stranding"

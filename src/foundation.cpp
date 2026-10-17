@@ -10,6 +10,7 @@ namespace foundation
 		constexpr const wchar_t *kModule = L"astra.addon64";
 		Api g_api{};
 		std::atomic<const Api *> g_ready{nullptr};
+		HMODULE g_module = nullptr; // the instance g_api was resolved from (present thread only: find() is its one writer)
 		char g_status[160] = "astra.addon64 (the Astra foundation) is not loaded: Astra cannot be shown";
 
 		template <class Fn>
@@ -22,11 +23,20 @@ namespace foundation
 
 	bool find()
 	{
-		if (g_ready.load(std::memory_order_acquire) != nullptr)
-			return true;
 		const HMODULE m = GetModuleHandleW(kModule);
+		if (m == g_module && g_ready.load(std::memory_order_acquire) != nullptr)
+			return true; // still the instance we last resolved
+		// the compositor is gone, or a DIFFERENT instance is loaded where an old one was linked (ReShade unloads
+		// and reloads its add-ons with every D3D device - DS2 does this once at start-up): drop the stale link
+		// FIRST, so a reader (per_frame, logf) sees nullptr rather than a pointer resolved from the old instance,
+		// then re-resolve against the module that is actually loaded now.
+		g_ready.store(nullptr, std::memory_order_release);
+		g_module = nullptr;
 		if (m == nullptr)
+		{
+			std::snprintf(g_status, sizeof(g_status), "astra.addon64 (the Astra foundation) is not loaded: Astra cannot be shown");
 			return false;
+		}
 		if (!get(m, g_api.version, "astra_provider_version"))
 		{
 			std::snprintf(g_status, sizeof(g_status), "astra.addon64 has no provider API: not the Astra foundation");
@@ -43,6 +53,7 @@ namespace foundation
 			return false;
 		}
 		std::snprintf(g_status, sizeof(g_status), "Astra foundation: provider API %d", version);
+		g_module = m;
 		g_ready.store(&g_api, std::memory_order_release);
 		return true;
 	}
