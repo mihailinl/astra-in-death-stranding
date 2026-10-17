@@ -45,8 +45,8 @@ put() { # put <source> <path relative to the game folder>
 }
 put "$AR/build/astra.addon64" astra.addon64
 put "$HERE/build/astra-ds.addon64" astra-ds.addon64
-put "$AR/shaders/AstraPassthrough.fx" reshade-shaders/Shaders/AstraPassthrough.fx
-put "$HERE/shaders/AstraGame.fxh" reshade-shaders/Shaders/AstraGame.fxh
+put "$AR/shaders/AstraPassthrough.fx" astra-reshade/Shaders/AstraPassthrough.fx
+put "$HERE/shaders/AstraGame.fxh" astra-reshade/Shaders/AstraGame.fxh
 
 sort -u "$MANIFEST.new" > "$MANIFEST"; rm -f "$MANIFEST.new"
 echo "installed into $GAME:"; sed 's/^/  /' "$MANIFEST"

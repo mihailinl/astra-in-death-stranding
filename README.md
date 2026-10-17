@@ -25,18 +25,22 @@ running (it is, when the companion is on).
 **By hand**, from a release's `astra-gi.zip` (the `ds1-v…` release for Director's Cut, `ds2-v…` for Death
 Stranding 2), into the game's folder (where `ds.exe` / `DS2.exe` is):
 
-- `dxgi.dll` (ReShade 6.8.0 with full add-on support) and `ReShade.ini`;
+- `dxgi.dll` (ReShade 6.8.0 with full add-on support);
 - `astra.addon64` and `astra-ds.addon64`;
-- `reshade-shaders/Shaders/AstraPassthrough.fx`, `AstraGame.fxh` and `ReShade.fxh`.
+- `astra-reshade/Shaders/AstraPassthrough.fx`, `AstraGame.fxh` and `ReShade.fxh`.
 
-If ReShade with add-on support is already there (for example from Minecraft in Death Stranding), keep your
-`dxgi.dll` and `ReShade.ini` and add the rest. Her engine's port is 25600 by default; Astra passes its own port and
-token on the game's command line (`-AstraConfig=<file>`).
+No `ReShade.ini` ships: ReShade rewrites that file while the game runs, and the add-on sets up what its effect
+needs and ReShade's defaults lack (its shaders' folder, the preset path, the first-start tutorial banner) only
+where another install hasn't already set them. If ReShade with add-on support is already there (for example from
+Minecraft in Death Stranding), keep your `dxgi.dll` and `ReShade.ini` and add the rest — the two mods' shader
+folders don't collide. Her engine's port is 25600 by default; Astra passes its own port and token on the game's
+command line (`-AstraConfig <file>`).
 
 **Linux (Proton):** ReShade loads as `dxgi.dll` only with the launch option
 `WINEDLLOVERRIDES="dxgi=n,b" %command%` (Astra's Games tab sets this override in the game's Proton prefix for you).
 
-Remove: delete those files again (and `dxgi.dll` + `ReShade.ini` if nothing else uses ReShade).
+Remove: delete those files again (and `dxgi.dll` if nothing else uses ReShade — `ReShade.ini` is ReShade's own
+rewritten settings file, never ours to remove).
 
 ## In the game
 
@@ -89,7 +93,7 @@ tools/package-gi.sh   # -> build/gi/ds1/astra-gi.zip, build/gi/ds2/astra-gi.zip 
 | `src/sun.cpp` | DS's sun (or moon), found in the game's memory |
 | `src/foundation.cpp` | the foundation's provider API (`extern/astra-reshade/include/astra_provider.h`), looked up in `astra.addon64` |
 | `shaders/AstraGame.fxh` | DS's hooks into the foundation's effect: DS's UI over her, Minecraft's blocks in front of her |
-| `gi/` | the release manifests (`ds1/`, `ds2/`) and their `ReShade.ini` |
+| `gi/` | the release manifests (`ds1/astra-gi.toml`, `ds2/astra-gi.toml`) — no `ReShade.ini`: `astra.addon64` sets up its own keys |
 | `extern/minecraft-in-death-stranding` | DS's camera, Sam, collision and UI, shared with the Minecraft mod |
 | `extern/astra-reshade` | the foundation |
 

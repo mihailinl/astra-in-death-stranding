@@ -4,7 +4,8 @@
 #   build/gi/ds2/astra-gi.zip   Death Stranding 2: On the Beach  -> the release tagged ds2-v<version>, as astra-gi.zip
 # Each is gi/<game>/astra-gi.toml + every file it names (+ LICENSES/), from
 #   ./build.sh's output (astra-ds.addon64, and the foundation's astra.addon64 from extern/astra-reshade),
-#   shaders/AstraGame.fxh and the foundation's AstraPassthrough.fx, gi/ReShade.ini,
+#   shaders/AstraGame.fxh and the foundation's AstraPassthrough.fx (no ReShade.ini: the add-on sets up its own
+#   ReShade.ini keys, astra-reshade/src/config_rules.h),
 #   ReShade 6.8.0 Addon's ReShade64.dll and ReShade.fxh (the Minecraft submodule's tools/fetch_deps.sh).
 # The foundation's tools/gi-pack.py fills in our digests, checks every pinned one and writes the zip (reproducible).
 set -e
@@ -27,11 +28,10 @@ mkdir -p "$CACHE"
 for game in ds1 ds2; do
 	OUT="$HERE/build/gi/$game/staged"
 	rm -rf "$OUT" "$HERE/build/gi/$game/astra-gi.zip"
-	mkdir -p "$OUT/reshade-shaders/Shaders" "$OUT/LICENSES"
+	mkdir -p "$OUT/astra-reshade/Shaders" "$OUT/LICENSES"
 	cp "$TP/reshade-6.8.0-addon/ReShade64.dll" "$OUT/dxgi.dll"
-	cp "$HERE/gi/ReShade.ini" "$OUT/ReShade.ini"
 	cp "$AR/build/astra.addon64" "$HERE/build/astra-ds.addon64" "$OUT/"
-	cp "$AR/shaders/AstraPassthrough.fx" "$HERE/shaders/AstraGame.fxh" "$TP/shaders/ReShade.fxh" "$OUT/reshade-shaders/Shaders/"
+	cp "$AR/shaders/AstraPassthrough.fx" "$HERE/shaders/AstraGame.fxh" "$TP/shaders/ReShade.fxh" "$OUT/astra-reshade/Shaders/"
 	cp "$HERE/LICENSE" "$OUT/LICENSES/astra-in-death-stranding-MIT.txt"
 	cp "$HERE/THIRD_PARTY.md" "$OUT/LICENSES/THIRD_PARTY.md"
 	cp "$AR/LICENSE" "$OUT/LICENSES/astra-reshade-MIT.txt"
